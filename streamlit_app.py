@@ -195,9 +195,7 @@ def query_web_links_and_forms(query: str) -> str:
         url = response.objects[0].properties.get("url_href")
         return f"Web Context (URL: {url}): {chunk}"
     return "Web Context: No relevant form or link found."
-
-
-# --- 4. LLM GENERATION FUNCTION (UPDATED) ---
+# --- 4. LLM GENERATION FUNCTION (Final Corrected Version) ---
 def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
     context_text = "\n---\n".join([chunk for chunk in retrieved_chunks if not chunk.endswith("found.")])
     if not context_text.strip():
@@ -212,15 +210,16 @@ def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
             temperature=0.1,
         )
         
-        # 🚩 CRITICAL FIX: Check if content is None before calling .strip()
+        # 🟢 CRITICAL FIX: Checking for None before calling .strip()
         llm_content = response.choices[0].message.content
         if llm_content is not None:
             return llm_content.strip()
         else:
+            # Fallback if OpenAI returns None content (even if the request succeeded)
             return "The language model returned an empty or invalid response. Please try again."
             
     except Exception as e:
-        # This catches API/network errors
+        # Fallback for API/network errors
         return f"An error occurred during LLM generation: {e}"
         
 
