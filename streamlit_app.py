@@ -1,4 +1,4 @@
-# --- Save this code as streamlit_app.py on GitHub (Final Version) ---
+# --- Save this code as streamlit_app.py on GitHub (Final Production Version) ---
 
 # --- IMPORTS (MUST BE AT THE TOP) ---
 import streamlit as st
@@ -50,8 +50,16 @@ def load_embedding_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 EMBEDDING_MODEL = load_embedding_model()
-openai_client = OpenAI(api_key=OPENAI_API_KEY) 
 WEAVIATE_CLIENT = None 
+
+# 🚩 CRITICAL FIX 1: OpenAI Client initialization with validation check
+try:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    # Basic API call to ensure key is valid and billing is active
+    openai_client.models.list() 
+except Exception as e:
+    st.error(f"OpenAI API Key validation failed! Please check your OPENAI_API_KEY and billing status. Error: {e}")
+    st.stop()
 
 
 # --- 2. CORE RAG / AGENTIC FUNCTIONS ---
@@ -195,6 +203,7 @@ def query_web_links_and_forms(query: str) -> str:
         url = response.objects[0].properties.get("url_href")
         return f"Web Context (URL: {url}): {chunk}"
     return "Web Context: No relevant form or link found."
+
 # --- 4. LLM GENERATION FUNCTION (Final Corrected Version) ---
 def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
     context_text = "\n---\n".join([chunk for chunk in retrieved_chunks if not chunk.endswith("found.")])
@@ -223,7 +232,7 @@ def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
         return f"An error occurred during LLM generation: {e}"
         
 
-# --- 5. AGENTIC ORCHESTRATOR (FINAL CORRECTED VERSION) ---
+# --- 5. AGENTIC ORCHESTRATOR (FINAL ROBUST EXCEPTION HANDLING) ---
 def orchestrator_agent(query_text: str):
     tools = [query_policy_and_baggage, query_flight_status, query_web_links_and_forms]
     tool_map = {t.__name__: t for t in tools}
@@ -239,8 +248,9 @@ def orchestrator_agent(query_text: str):
             temperature=0.0
         )
     except Exception as e:
-        # Catch API call failure right here
-        return f"OpenAI API call failed during orchestration: {e}", ["API Error"]
+        # 🚩 CRITICAL FIX 2: Safely handle exception object to avoid NoneType error
+        error_message = str(e) if e else "Unknown OpenAI API Error."
+        return f"OpenAI API call failed during orchestration. Details: {error_message}", ["API Error"]
 
     # 🚩 CRITICAL FIX: Ensure response and tool_calls are not None
     if not response or not response.choices or not response.choices[0].message:
@@ -255,7 +265,6 @@ def orchestrator_agent(query_text: str):
             function_name = tool_call.function.name
             function_to_call = tool_map.get(function_name)
             if function_to_call:
-                # Assuming query_text is always a string, so tool_output should be safe.
                 tool_output = function_to_call(query_text) 
                 retrieved_chunks.append(tool_output)
                 tools_used.append(function_name.replace("query_", "").replace("_", " ").title())
@@ -302,7 +311,8 @@ try:
                 full_response = f"{final_answer}\n\n{metadata}"
                 
             except Exception as e:
-                full_response = f"An unexpected error occurred during orchestration. Error: {e}"
+                # This fallback should ideally not be hit, but kept for absolute safety
+                full_response = f"An unexpected critical error occurred during orchestration. Error: {e}"
         
         with st.chat_message("assistant"):
             st.markdown(full_response)
