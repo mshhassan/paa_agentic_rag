@@ -223,20 +223,28 @@ def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
         return f"An error occurred during LLM generation: {e}"
         
 
-# --- 5. AGENTIC ORCHESTRATOR ---
+# --- 5. AGENTIC ORCHESTRATOR (FINAL CORRECTED VERSION) ---
 def orchestrator_agent(query_text: str):
     tools = [query_policy_and_baggage, query_flight_status, query_web_links_and_forms]
     tool_map = {t.__name__: t for t in tools}
     
     messages = [{"role": "system", "content": "You are a highly analytical PAA supervisor agent. Analyze the user's query and decide which RAG functions (tools) are necessary to fully answer it. You can call multiple tools in parallel if needed."}, {"role": "user", "content": query_text}]
     
-    response = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo-1106", 
-        messages=messages,
-        tools=[{"type": "function", "function": {"name": t.__name__, "description": t.__doc__.strip(), "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The specific part of the user query relevant to this tool's function."}}, "required": ["query"],}}} for t in tools],
-        tool_choice="auto", 
-        temperature=0.0
-    )
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo-1106", 
+            messages=messages,
+            tools=[{"type": "function", "function": {"name": t.__name__, "description": t.__doc__.strip(), "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The specific part of the user query relevant to this tool's function."}}, "required": ["query"],}}} for t in tools],
+            tool_choice="auto", 
+            temperature=0.0
+        )
+    except Exception as e:
+        # Catch API call failure right here
+        return f"OpenAI API call failed during orchestration: {e}", ["API Error"]
+
+    # 🚩 CRITICAL FIX: Ensure response and tool_calls are not None
+    if not response or not response.choices or not response.choices[0].message:
+        return "The Orchestration model returned an empty or invalid primary response.", ["Invalid Response"]
 
     tool_calls = response.choices[0].message.tool_calls
     retrieved_chunks = []
@@ -247,16 +255,17 @@ def orchestrator_agent(query_text: str):
             function_name = tool_call.function.name
             function_to_call = tool_map.get(function_name)
             if function_to_call:
+                # Assuming query_text is always a string, so tool_output should be safe.
                 tool_output = function_to_call(query_text) 
                 retrieved_chunks.append(tool_output)
                 tools_used.append(function_name.replace("query_", "").replace("_", " ").title())
     else:
+        # If no tool calls are made, use the default policy tool
         retrieved_chunks.append(query_policy_and_baggage(query_text))
         tools_used.append("Policy and Baggage (Default)")
 
     final_answer = generate_answer_with_llm(query_text, retrieved_chunks)
     return final_answer, tools_used
-
 
 # --- 6. STREAMLIT UI DEFINITION ---
 st.set_page_config(page_title="PAA Agentic RAG System", layout="wide")
