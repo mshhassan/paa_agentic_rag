@@ -1,0 +1,9 @@
+streamlit
+openai
+weaviate-client
+sentence-transformers
+langchain-text-splitters
+pypdf
+beautifulsoup4
+requests
+lxml
