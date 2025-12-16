@@ -13,3 +13,4 @@ lxml
 google-genai
 # If you are using Google's generative AI, you should explicitly include the core library
 google-api-core
+langchain-text-splitters  <-- YEH LINE ZAROOR ADD KAREIN
