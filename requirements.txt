@@ -4,6 +4,7 @@ weaviate-client
 sentence-transformers
 langchain-text-splitters
 pypdf
-beautifulsoup4
 requests
+beautifulsoup4
 lxml
+google-genai  <-- YEH LINE ZAROOR ADD KAREIN
