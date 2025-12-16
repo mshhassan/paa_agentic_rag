@@ -197,21 +197,32 @@ def query_web_links_and_forms(query: str) -> str:
     return "Web Context: No relevant form or link found."
 
 
-# --- 4. LLM GENERATION FUNCTION ---
+# --- 4. LLM GENERATION FUNCTION (UPDATED) ---
 def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
     context_text = "\n---\n".join([chunk for chunk in retrieved_chunks if not chunk.endswith("found.")])
     if not context_text.strip():
         return "I am sorry, I could not find any relevant information in the available documents (Policy, Flight Status, or Website) to answer your question."
+    
     prompt = f"""You are an AI assistant for Pakistan Airport Authority (PAA). Your goal is to answer a user's question by combining information from the provided contexts, which are separated by source tags (e.g., 'Policy Context:', 'Flight Context:'). 1. **Strictly adhere** to the information in the CONTEXT section. 2. Synthesize all relevant points into one concise, helpful response. 3. If any requested piece of information is missing from the context, state it clearly. --- USER QUESTION: {user_query} --- CONTEXT (Synthesize these sources): {context_text} --- Final Answer (In English, based ONLY on the context):"""
+    
     try:
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "system", "content": "You are a helpful and concise RAG assistant."}, {"role": "user", "content": prompt}],
             temperature=0.1,
         )
-        return response.choices[0].message.content.strip()
+        
+        # 🚩 CRITICAL FIX: Check if content is None before calling .strip()
+        llm_content = response.choices[0].message.content
+        if llm_content is not None:
+            return llm_content.strip()
+        else:
+            return "The language model returned an empty or invalid response. Please try again."
+            
     except Exception as e:
+        # This catches API/network errors
         return f"An error occurred during LLM generation: {e}"
+        
 
 # --- 5. AGENTIC ORCHESTRATOR ---
 def orchestrator_agent(query_text: str):
