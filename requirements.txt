@@ -1,16 +1,15 @@
 streamlit
-# Weaviate client
+# Vector Database Client
 weaviate-client
-# For embedding
+# Embedding Model (RAG ke liye zaroori)
 sentence-transformers
-# PDF processing
+# PDF, HTML, XML Parsing
 pypdf
-# HTML/Web scraping
 beautifulsoup4
 requests
 lxml
-# Google Gemini SDK
+# Text Splitter
+langchain-text-splitters
+# Gemini SDK
 google-genai
-# If you are using Google's generative AI, you should explicitly include the core library
 google-api-core
-langchain-text-splitters  <-- YEH LINE ZAROOR ADD KAREIN
