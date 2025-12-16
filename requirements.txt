@@ -1,10 +1,15 @@
 streamlit
-openai
+# Weaviate client
 weaviate-client
+# For embedding
 sentence-transformers
-langchain-text-splitters
+# PDF processing
 pypdf
-requests
+# HTML/Web scraping
 beautifulsoup4
+requests
 lxml
-google-genai  <-- YEH LINE ZAROOR ADD KAREIN
+# Google Gemini SDK
+google-genai
+# If you are using Google's generative AI, you should explicitly include the core library
+google-api-core
