@@ -209,23 +209,27 @@ def query_web_links_and_forms(query: str) -> str:
         return f"Web Context (URL: {url}): {chunk}"
     return "Web Context: No relevant form or link found."
 
-# --- 4. LLM GENERATION FUNCTION (Final Corrected Version for Gemini SDK) ---
+# --- 4. LLM GENERATION FUNCTION (FINAL ROBUST FIX for Gemini SDK) ---
 def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
     context_text = "\n---\n".join([chunk for chunk in retrieved_chunks if not chunk.endswith("found.")])
     if not context_text.strip():
         return "I am sorry, I could not find any relevant information in the available documents (Policy, Flight Status, or Website) to answer your question."
     
-    system_prompt = "You are an AI assistant for Pakistan Airport Authority (PAA). Your goal is to answer a user's question by combining information from the provided contexts, which are separated by source tags (e.g., 'Policy Context:', 'Flight Context:'). 1. **Strictly adhere** to the information in the CONTEXT section. 2. Synthesize all relevant points into one concise, helpful response. 3. If any requested piece of information is missing from the context, state it clearly."
-
-    user_message = f"""--- USER QUESTION: {user_query} --- CONTEXT (Synthesize these sources): {context_text} --- Final Answer (In English, based ONLY on the context):"""
+    # System and User instructions ko combine kar rahe hain
+    full_prompt = (
+        "You are an AI assistant for Pakistan Airport Authority (PAA). Your goal is to answer a user's question by combining information from the provided contexts, which are separated by source tags (e.g., 'Policy Context:', 'Flight Context:'). "
+        "1. **Strictly adhere** to the information in the CONTEXT section. "
+        "2. Synthesize all relevant points into one concise, helpful response. "
+        "3. If any requested piece of information is missing from the context, state it clearly. "
+        f"--- USER QUESTION: {user_query} --- CONTEXT (Synthesize these sources): {context_text} --- Final Answer (In English, based ONLY on the context):"
+    )
     
     try:
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
-            # 🟢 FIX: Content structure for System and User prompts
+            # 🟢 FIX: Only one user role with the full prompt
             contents=[
-                types.Content(role="system", parts=[types.Part.from_text(system_prompt)]),
-                types.Content(role="user", parts=[types.Part.from_text(user_message)])
+                types.Content(role="user", parts=[types.Part.from_text(full_prompt)])
             ],
             config=types.GenerateContentConfig(temperature=0.1)
         )
@@ -235,21 +239,23 @@ def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
     except Exception as e:
         return f"An error occurred during Gemini LLM generation: {e}"
 
-# --- 5. AGENTIC ORCHESTRATOR (FINAL CORRECTION for Gemini SDK) ---
+# --- 5. AGENTIC ORCHESTRATOR (FINAL ROBUST FIX for Gemini SDK) ---
 def orchestrator_agent(query_text: str):
     tools = [query_policy_and_baggage, query_flight_status, query_web_links_and_forms]
     tool_map = {t.__name__: t for t in tools}
     
-    # 🟢 FIX: Correct way to define system and user messages for Gemini SDK
+    # Initial message for tool calling
+    initial_prompt = (
+        "You are a highly analytical PAA supervisor agent. Analyze the user's query and decide which RAG functions (tools) are necessary to fully answer it. "
+        "You can call multiple tools in parallel if needed. Do not answer questions if the tool output is 'No relevant policy found.' or similar negative output. Only use the provided tools. "
+        f"User Query: {query_text}"
+    )
+
+    # 🟢 FIX: Only one user role for the initial prompt
     messages = [
-        # System instructions go in the first Content block as the initial text part
-        types.Content(role="user", parts=[
-            types.Part.from_text("You are a highly analytical PAA supervisor agent. Analyze the user's query and decide which RAG functions (tools) are necessary to fully answer it. You can call multiple tools in parallel if needed. Do not answer questions if the tool output is 'No relevant policy found.' or similar negative output. Only use the provided tools."),
-            types.Part.from_text(query_text) # Appending the user query to the instructions
-        ])
+        types.Content(role="user", parts=[types.Part.from_text(initial_prompt)])
     ]
     
-    # Tool definitions for Gemini
     gemini_tools = [t for t in tools]
     
     try:
@@ -262,12 +268,14 @@ def orchestrator_agent(query_text: str):
         error_message = str(e) if e else "Unknown Gemini API Error."
         return f"Gemini API call failed during orchestration. Details: {error_message}", ["API Error"]
 
-    # Processing tool calls in a loop (Gemini style)
     retrieved_chunks = []
     tools_used = []
     
     if response.function_calls:
         # Step 1: Execute Tool Calls
+        # messages list mein model ke function call ko shamil karein
+        messages.append(response.candidates[0].content)
+
         for function_call in response.function_calls:
             function_name = function_call.name
             function_to_call = tool_map.get(function_name)
@@ -278,16 +286,15 @@ def orchestrator_agent(query_text: str):
                 retrieved_chunks.append(tool_output)
                 tools_used.append(function_name.replace("query_", "").replace("_", " ").title())
                 
-                # Append the function call and the function response to messages
-                messages.append(response.candidates[0].content)
+                # Tool ka output messages mein shamil karein
                 messages.append(types.Content(
                     role="function", 
                     parts=[types.Part.from_function_response(name=function_name, response={"content": tool_output})]
                 ))
         
-        # Step 2: Second call to get the final answer after tool execution
-        # Check if tools were actually used and outputs were generated before the second call
+        # Step 2: Second call to get the final answer after tool execution (RAG)
         if retrieved_chunks:
+            # Second call ke liye tools hata de, taki woh sirf answer generate kare
             final_response = gemini_client.models.generate_content(
                 model='gemini-2.5-flash', 
                 contents=messages,
@@ -295,17 +302,18 @@ def orchestrator_agent(query_text: str):
             )
             return final_response.text.strip(), tools_used
 
-    # Fallback if no tool calls are made or if the initial response was just text
+    # Fallback: Agar tool call nahi hua to seedha RAG ya default policy call
     if response.text and response.text.strip():
-        # If the model directly provided a text answer without tool calls
+        # Agar model ne seedha answer diya
         return response.text.strip(), ["Direct LLM Response"]
 
-    # Default fallback: If no tool calls, perform a RAG call using the Policy tool as default
+    # Default fallback: Agar model ne na tool call kiya aur na answer diya
     retrieved_chunks.append(query_policy_and_baggage(query_text))
     tools_used.append("Policy and Baggage (Default)")
 
     final_answer = generate_answer_with_llm(query_text, retrieved_chunks)
     return final_answer, tools_used
+    
 
 # --- 6. STREAMLIT UI DEFINITION ---
 st.set_page_config(page_title="PAA Agentic RAG System (Gemini)", layout="wide")
