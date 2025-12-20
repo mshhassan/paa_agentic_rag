@@ -1,7 +1,9 @@
-# --- Save this code as streamlit_app.py on GitHub (Final Version using Gemini) ---
+# --- Save this code as streamlit_app.py on GitHub (Final Version using DeepSeek) ---
 
 # --- IMPORTS (MUST BE AT THE TOP) ---
 import streamlit as st
+# 🚩 CHANGE: Revert to OpenAI import, which works with DeepSeek's API structure
+from openai import OpenAI 
 import json
 import re
 from typing import List
@@ -18,10 +20,9 @@ import requests
 import xml.etree.ElementTree as ET
 import os
 import warnings
-
-# 🚩 NEW GEMINI IMPORTS
-from google import genai
-from google.genai import types
+# 🚩 REMOVE: Gemini imports are no longer needed
+# from google import genai
+# from google.genai import types 
 
 # Suppress InsecureRequestWarning for PAA site
 warnings.filterwarnings("ignore", "Unverified HTTPS request is being made")
@@ -31,8 +32,8 @@ warnings.filterwarnings("ignore", "Unverified HTTPS request is being made")
 try:
     WEAVIATE_URL_BASE = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud" 
     WEAVIATE_API_KEY = st.secrets["WEAVIATE_API_KEY"] 
-    # 🚩 CHANGE: Read GEMINI_API_KEY instead of OPENAI_API_KEY
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"] 
+    # 🚩 CHANGE: Read DEEPSEEK_API_KEY instead of GEMINI_API_KEY
+    DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"] 
 except KeyError as e:
     st.error(f"Missing API key in Streamlit Secrets: {e}. Please add it to your secrets.toml file.")
     st.stop()
@@ -55,14 +56,17 @@ def load_embedding_model():
 EMBEDDING_MODEL = load_embedding_model()
 WEAVIATE_CLIENT = None 
 
-# 🚩 CRITICAL FIX 1: Gemini Client initialization with validation check
+# 🚩 CRITICAL FIX 1: DeepSeek Client initialization using OpenAI structure
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
 try:
-    # Uses the key from st.secrets["GEMINI_API_KEY"] automatically via OS environment
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    # Basic API call to ensure key is valid
-    gemini_client.models.list() 
+    deepseek_client = OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url=DEEPSEEK_BASE_URL # Use DeepSeek's endpoint
+    )
+    # Basic API call (DeepSeek models.list is not available, so we skip the ping for simplicity)
 except Exception as e:
-    st.error(f"Gemini API Key validation failed! Please check your GEMINI_API_KEY. Error: {e}")
+    st.error(f"DeepSeek Client initialization failed! Please check your DEEPSEEK_API_KEY. Error: {e}")
     st.stop()
 
 
@@ -209,13 +213,14 @@ def query_web_links_and_forms(query: str) -> str:
         return f"Web Context (URL: {url}): {chunk}"
     return "Web Context: No relevant form or link found."
 
-# --- 4. LLM GENERATION FUNCTION (FINAL ROBUST FIX using system_instruction) ---
+# --- 4. LLM GENERATION FUNCTION (UPDATED for DeepSeek) ---
 def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
     context_text = "\n---\n".join([chunk for chunk in retrieved_chunks if not chunk.endswith("found.")])
     if not context_text.strip():
         return "I am sorry, I could not find any relevant information in the available documents (Policy, Flight Status, or Website) to answer your question."
     
-    system_instruction_text = (
+    # DeepSeek supports System and User roles
+    system_prompt = (
         "You are an AI assistant for Pakistan Airport Authority (PAA). Your goal is to answer a user's question by combining information from the provided contexts. "
         "1. **Strictly adhere** to the information in the CONTEXT section. "
         "2. Synthesize all relevant points into one concise, helpful response. "
@@ -225,102 +230,113 @@ def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
     user_message = f"""--- USER QUESTION: {user_query} --- CONTEXT (Synthesize these sources): {context_text} --- Final Answer (In English, based ONLY on the context):"""
     
     try:
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            # 🟢 FIX: contents mein sirf user message aur system_instruction ko config mein
-            contents=[
-                types.Content(role="user", parts=[types.Part.from_text(user_message)])
+        response = deepseek_client.chat.completions.create(
+            model='deepseek-chat', # DeepSeek's main chat model
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
             ],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                system_instruction=system_instruction_text # System prompt yahan jaayega
-            )
+            temperature=0.1,
         )
         
-        return response.text.strip()
+        # Checking for None before returning
+        llm_content = response.choices[0].message.content
+        if llm_content is not None:
+            return llm_content.strip()
+        else:
+            return "The DeepSeek language model returned an empty or invalid response."
             
     except Exception as e:
-        return f"An error occurred during Gemini LLM generation: {e}"
+        return f"An error occurred during DeepSeek LLM generation: {e}"
+        
 
-# --- 5. AGENTIC ORCHESTRATOR (FINAL ROBUST FIX using system_instruction) ---
+# --- 5. AGENTIC ORCHESTRATOR (UPDATED for DeepSeek) ---
 def orchestrator_agent(query_text: str):
     tools = [query_policy_and_baggage, query_flight_status, query_web_links_and_forms]
     tool_map = {t.__name__: t for t in tools}
     
-    # System instruction for the Orchestrator
-    orchestrator_system_instruction = (
+    # DeepSeek supports standard tool calling similar to OpenAI's function calling
+    
+    orchestrator_system_prompt = (
         "You are a highly analytical PAA supervisor agent. Analyze the user's query and decide which RAG functions (tools) are necessary to fully answer it. "
         "You can call multiple tools in parallel if needed. Do not answer questions if the tool output is 'No relevant policy found.' or similar negative output. Only use the provided tools."
     )
     
-    # Initial message for tool calling
     messages = [
-        # 🟢 FIX: Only one user role with the query
-        types.Content(role="user", parts=[types.Part.from_text(f"User Query: {query_text}")])
+        {"role": "system", "content": orchestrator_system_prompt},
+        {"role": "user", "content": query_text}
     ]
     
-    gemini_tools = [t for t in tools]
+    # Tool definitions for DeepSeek (standard OpenAI format)
+    tool_definitions = [
+        {"type": "function", "function": {"name": t.__name__, "description": t.__doc__.strip(), "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The specific part of the user query relevant to this tool's function."}}, "required": ["query"],}}} 
+        for t in tools
+    ]
     
     try:
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash', 
-            contents=messages,
-            config=types.GenerateContentConfig(
-                tools=gemini_tools, 
-                temperature=0.0,
-                system_instruction=orchestrator_system_instruction # System prompt yahan jaayega
-            )
+        response = deepseek_client.chat.completions.create(
+            model='deepseek-coder', # DeepSeek Coder is often better at tool use/function calling
+            messages=messages,
+            tools=tool_definitions,
+            tool_choice="auto", 
+            temperature=0.0
         )
     except Exception as e:
-        error_message = str(e) if e else "Unknown Gemini API Error."
-        return f"Gemini API call failed during orchestration. Details: {error_message}", ["API Error"]
+        error_message = str(e) if e else "Unknown DeepSeek API Error."
+        return f"DeepSeek API call failed during orchestration. Details: {error_message}", ["API Error"]
 
+    # Processing tool calls (OpenAI style)
+    tool_calls = response.choices[0].message.tool_calls
     retrieved_chunks = []
     tools_used = []
-    
-    if response.function_calls:
-        messages.append(response.candidates[0].content)
 
-        for function_call in response.function_calls:
-            function_name = function_call.name
+    if tool_calls:
+        # Step 1: Execute Tool Calls
+        messages.append(response.choices[0].message) # Add tool call message
+
+        for tool_call in tool_calls:
+            function_name = tool_call.function.name
             function_to_call = tool_map.get(function_name)
             
             if function_to_call:
+                # Assuming query_text is always passed as the argument
                 tool_output = function_to_call(query_text) 
                 retrieved_chunks.append(tool_output)
                 tools_used.append(function_name.replace("query_", "").replace("_", " ").title())
                 
-                messages.append(types.Content(
-                    role="function", 
-                    parts=[types.Part.from_function_response(name=function_name, response={"content": tool_output})]
-                ))
+                # Tool output message
+                messages.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": function_name,
+                    "content": tool_output,
+                })
         
+        # Step 2: Second call to get the final answer after tool execution (RAG)
         if retrieved_chunks:
-            # Second call to get the final answer (RAG)
-            final_response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash', 
-                contents=messages,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    system_instruction=orchestrator_system_instruction # System instruction yahan bhi de dein
-                )
+            final_response = deepseek_client.chat.completions.create(
+                model='deepseek-coder', 
+                messages=messages,
+                temperature=0.1
             )
-            return final_response.text.strip(), tools_used
-
+            llm_content = final_response.choices[0].message.content
+            if llm_content is not None:
+                return llm_content.strip(), tools_used
+            
     # Fallback to direct text response or default policy call
-    if response.text and response.text.strip():
-        return response.text.strip(), ["Direct LLM Response"]
+    if response.choices[0].message.content and response.choices[0].message.content.strip():
+        return response.choices[0].message.content.strip(), ["Direct LLM Response"]
 
+    # Default fallback: If no tool calls and no direct answer, perform a RAG call using the Policy tool as default
     retrieved_chunks.append(query_policy_and_baggage(query_text))
     tools_used.append("Policy and Baggage (Default)")
 
     final_answer = generate_answer_with_llm(query_text, retrieved_chunks)
     return final_answer, tools_used
-    
 
 # --- 6. STREAMLIT UI DEFINITION ---
-st.set_page_config(page_title="PAA Agentic RAG System (Gemini)", layout="wide")
-st.title("🇵🇰 PAA Agentic RAG Chatbot (Powered by Gemini)") # Updated Title
+st.set_page_config(page_title="PAA Agentic RAG System (DeepSeek)", layout="wide")
+st.title("🇵🇰 PAA Agentic RAG Chatbot (Powered by DeepSeek)") # Updated Title
 st.markdown("This agent can answer complex questions by automatically routing queries to Policy (PDF), Flight Status (XML), or Web Link RAG sources.")
 st.markdown("---")
 
