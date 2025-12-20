@@ -1,6 +1,5 @@
 streamlit
-# DeepSeek calls ke liye zaroori hai
-openai
+google-genai
 weaviate-client
 sentence-transformers
 pypdf
