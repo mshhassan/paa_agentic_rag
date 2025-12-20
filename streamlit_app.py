@@ -250,89 +250,53 @@ def generate_answer_with_llm(user_query, retrieved_chunks: List[str]):
         return f"An error occurred during DeepSeek LLM generation: {e}"
         
 
-# --- 5. AGENTIC ORCHESTRATOR (UPDATED for DeepSeek) ---
 def orchestrator_agent(query_text: str):
-    tools = [query_policy_and_baggage, query_flight_status, query_web_links_and_forms]
-    tool_map = {t.__name__: t for t in tools}
-    
-    # DeepSeek supports standard tool calling similar to OpenAI's function calling
-    
-    orchestrator_system_prompt = (
-        "You are a highly analytical PAA supervisor agent. Analyze the user's query and decide which RAG functions (tools) are necessary to fully answer it. "
-        "You can call multiple tools in parallel if needed. Do not answer questions if the tool output is 'No relevant policy found.' or similar negative output. Only use the provided tools."
-    )
-    
-    messages = [
-        {"role": "system", "content": orchestrator_system_prompt},
-        {"role": "user", "content": query_text}
-    ]
-    
-    # Tool definitions for DeepSeek (standard OpenAI format)
-    tool_definitions = [
-        {"type": "function", "function": {"name": t.__name__, "description": t.__doc__.strip(), "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The specific part of the user query relevant to this tool's function."}}, "required": ["query"],}}} 
-        for t in tools
-    ]
+    # ... (Keep tools and messages definition same as before)
     
     try:
         response = deepseek_client.chat.completions.create(
-            model='deepseek-coder', # DeepSeek Coder is often better at tool use/function calling
+            model='deepseek-chat', # 💡 Tip: Standard 'chat' model is often more stable
             messages=messages,
             tools=tool_definitions,
             tool_choice="auto", 
             temperature=0.0
         )
-    except Exception as e:
-        error_message = str(e) if e else "Unknown DeepSeek API Error."
-        return f"DeepSeek API call failed during orchestration. Details: {error_message}", ["API Error"]
-
-    # Processing tool calls (OpenAI style)
-    tool_calls = response.choices[0].message.tool_calls
-    retrieved_chunks = []
-    tools_used = []
-
-    if tool_calls:
-        # Step 1: Execute Tool Calls
-        messages.append(response.choices[0].message) # Add tool call message
-
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            function_to_call = tool_map.get(function_name)
-            
-            if function_to_call:
-                # Assuming query_text is always passed as the argument
-                tool_output = function_to_call(query_text) 
-                retrieved_chunks.append(tool_output)
-                tools_used.append(function_name.replace("query_", "").replace("_", " ").title())
-                
-                # Tool output message
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": function_name,
-                    "content": tool_output,
-                })
         
-        # Step 2: Second call to get the final answer after tool execution (RAG)
-        if retrieved_chunks:
-            final_response = deepseek_client.chat.completions.create(
-                model='deepseek-coder', 
-                messages=messages,
-                temperature=0.1
-            )
-            llm_content = final_response.choices[0].message.content
-            if llm_content is not None:
-                return llm_content.strip(), tools_used
+        # 🟢 SAFETY CHECK: If model returns a text response directly
+        direct_content = response.choices[0].message.content
+        
+        tool_calls = response.choices[0].message.tool_calls
+        retrieved_chunks = []
+        tools_used = []
+
+        if tool_calls:
+            messages.append(response.choices[0].message)
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_to_call = tool_map.get(function_name)
+                if function_to_call:
+                    tool_output = function_to_call(query_text) 
+                    retrieved_chunks.append(tool_output)
+                    tools_used.append(function_name.replace("query_", "").replace("_", " ").title())
+                    messages.append({"tool_call_id": tool_call.id, "role": "tool", "name": function_name, "content": tool_output})
             
-    # Fallback to direct text response or default policy call
-    if response.choices[0].message.content and response.choices[0].message.content.strip():
-        return response.choices[0].message.content.strip(), ["Direct LLM Response"]
+            if retrieved_chunks:
+                final_res = deepseek_client.chat.completions.create(
+                    model='deepseek-chat', 
+                    messages=messages,
+                    temperature=0.1
+                )
+                final_content = final_res.choices[0].message.content
+                return final_content.strip() if final_content else "No answer generated.", tools_used
+        
+        # 🟢 FINAL FALLBACK: Return direct content if tool calls were empty
+        if direct_content:
+            return direct_content.strip(), ["Direct Response"]
+            
+        return "DeepSeek could not determine an action.", ["No Tools Used"]
 
-    # Default fallback: If no tool calls and no direct answer, perform a RAG call using the Policy tool as default
-    retrieved_chunks.append(query_policy_and_baggage(query_text))
-    tools_used.append("Policy and Baggage (Default)")
-
-    final_answer = generate_answer_with_llm(query_text, retrieved_chunks)
-    return final_answer, tools_used
+    except Exception as e:
+        return f"DeepSeek API Error: {e}", ["API Error"]
 
 # --- 6. STREAMLIT UI DEFINITION ---
 st.set_page_config(page_title="PAA Agentic RAG System (DeepSeek)", layout="wide")
