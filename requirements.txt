@@ -1,15 +1,10 @@
 streamlit
-# Vector Database Client
+# DeepSeek calls ke liye zaroori hai
+openai
 weaviate-client
-# Embedding Model (RAG ke liye zaroori)
 sentence-transformers
-# PDF, HTML, XML Parsing
 pypdf
 beautifulsoup4
 requests
 lxml
-# Text Splitter
 langchain-text-splitters
-# Gemini SDK
-google-genai
-google-api-core
