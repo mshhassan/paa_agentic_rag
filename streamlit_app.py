@@ -254,50 +254,94 @@ def orchestrator_agent(query_text: str):
     # ... (Keep tools and messages definition same as before)
     
     try:
+        response = deepseek_client.# --- 5. AGENTIC ORCHESTRATOR (DEEPSEEK FIX) ---
+def orchestrator_agent(query_text: str):
+    tools = [query_policy_and_baggage, query_flight_status, query_web_links_and_forms]
+    tool_map = {t.__name__: t for t in tools}
+    
+    # 🟢 FIX: Define 'messages' list first
+    orchestrator_system_prompt = (
+        "You are a highly analytical PAA supervisor agent. Analyze the user's query and decide which RAG functions (tools) are necessary. "
+        "Only use the provided tools to answer."
+    )
+    
+    messages = [
+        {"role": "system", "content": orchestrator_system_prompt},
+        {"role": "user", "content": query_text}
+    ]
+    
+    # Tool definitions
+    tool_definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": t.__name__,
+                "description": f"Use this tool to query {t.__name__.replace('query_', '')}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"}
+                    },
+                    "required": ["query"],
+                }
+            }
+        } for t in tools
+    ]
+    
+    try:
         response = deepseek_client.chat.completions.create(
-            model='deepseek-chat', # 💡 Tip: Standard 'chat' model is often more stable
+            model='deepseek-chat', 
             messages=messages,
             tools=tool_definitions,
             tool_choice="auto", 
             temperature=0.0
         )
         
-        # 🟢 SAFETY CHECK: If model returns a text response directly
-        direct_content = response.choices[0].message.content
-        
-        tool_calls = response.choices[0].message.tool_calls
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
         retrieved_chunks = []
         tools_used = []
 
         if tool_calls:
-            messages.append(response.choices[0].message)
+            # Add the assistant's tool call message to history
+            messages.append(response_message)
+
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
                 function_to_call = tool_map.get(function_name)
+                
                 if function_to_call:
                     tool_output = function_to_call(query_text) 
                     retrieved_chunks.append(tool_output)
                     tools_used.append(function_name.replace("query_", "").replace("_", " ").title())
-                    messages.append({"tool_call_id": tool_call.id, "role": "tool", "name": function_name, "content": tool_output})
+                    
+                    # Add tool output to history
+                    messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": tool_output,
+                    })
             
             if retrieved_chunks:
+                # Final call to generate the natural language answer
                 final_res = deepseek_client.chat.completions.create(
                     model='deepseek-chat', 
                     messages=messages,
                     temperature=0.1
                 )
                 final_content = final_res.choices[0].message.content
-                return final_content.strip() if final_content else "No answer generated.", tools_used
+                return final_content.strip() if final_content else "I found the info but couldn't summarize it.", tools_used
         
-        # 🟢 FINAL FALLBACK: Return direct content if tool calls were empty
-        if direct_content:
-            return direct_content.strip(), ["Direct Response"]
+        # Fallback if no tools were called
+        if response_message.content:
+            return response_message.content.strip(), ["Direct Response"]
             
-        return "DeepSeek could not determine an action.", ["No Tools Used"]
+        return "I'm not sure which tool to use for this.", ["None"]
 
     except Exception as e:
-        return f"DeepSeek API Error: {e}", ["API Error"]
-
+        return f"DeepSeek API Error: {str(e)}", ["API Error"]
+        
 # --- 6. STREAMLIT UI DEFINITION ---
 st.set_page_config(page_title="PAA Agentic RAG System (DeepSeek)", layout="wide")
 st.title("🇵🇰 PAA Agentic RAG Chatbot (Powered by DeepSeek)") # Updated Title
