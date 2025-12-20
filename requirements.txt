@@ -6,3 +6,9 @@ pypdf
 langchain-text-splitters
 beautifulsoup4
 requests
+streamlit
+openai
+weaviate-client
+sentence-transformers
+pypdf
+langchain-text-splitters
