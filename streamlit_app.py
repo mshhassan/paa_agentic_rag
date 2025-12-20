@@ -7,6 +7,7 @@ from weaviate.classes.data import DataObject
 from sentence_transformers import SentenceTransformer 
 from langchain_text_splitters import RecursiveCharacterTextSplitter 
 from pypdf import PdfReader
+import xml.etree.ElementTree as ET
 import os
 import json
 import warnings
@@ -17,12 +18,11 @@ warnings.filterwarnings("ignore")
 try:
     WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud" 
     WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"] 
-    # Lazmi: Streamlit secrets mein 'OPENAI_API_KEY' add karein
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"] 
     
     client_openai = OpenAI(api_key=OPENAI_API_KEY)
 except KeyError as e:
-    st.error(f"Secret Missing: {e}. Please add OPENAI_API_KEY to Streamlit Secrets.")
+    st.error(f"Secret Missing: {e}. Please add OPENAI_API_KEY in Streamlit Secrets.")
     st.stop()
 
 @st.cache_resource
@@ -46,7 +46,7 @@ def get_weaviate_client():
         )
     return client
 
-@st.cache_resource(show_spinner="Reading PDF...")
+@st.cache_resource(show_spinner="Ingesting Policy Data...")
 def ingest_data(_client):
     if os.path.exists("policy_baggage.pdf"):
         reader = PdfReader("policy_baggage.pdf")
@@ -61,97 +61,120 @@ def ingest_data(_client):
             collection.data.insert_many(objs)
     return True
 
-# --- 3. RETRIEVAL TOOL ---
+# --- 3. TOOLS (PDF & XML) ---
+
 def search_baggage_policy(query: str):
-    """Searches the PAA baggage policy PDF for specific rules and weight limits."""
+    """Searches the PAA baggage policy PDF."""
     w_client = get_weaviate_client()
     col = w_client.collections.get("PAAPolicy")
     res = col.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=2)
-    if res.objects:
-        return "\n".join([o.properties['content'] for o in res.objects])
-    return "No relevant baggage policy found in the documents."
+    return "\n".join([o.properties['content'] for o in res.objects]) if res.objects else "No policy found."
 
-# --- 4. OPENAI AGENT LOGIC ---
+def get_flight_status(flight_num: str, date: str = None):
+    """Parses flight_records.xml to find the status of a specific flight."""
+    if not os.path.exists("flight_records.xml"):
+        return "Flight records file not found."
+    
+    try:
+        tree = ET.parse("flight_records.xml")
+        root = tree.getroot()
+        
+        # Flight number clean-up (e.g., SV726)
+        flight_num = flight_num.strip().upper()
+        
+        for flight in root.findall('flight'):
+            xml_flight_num = flight.find('number').text.strip().upper()
+            xml_date = flight.find('date').text.strip()
+            
+            if xml_flight_num == flight_num:
+                # Agar date di gayi hai toh match karo, warna flight number se return karo
+                if date and date not in xml_date:
+                    continue
+                
+                status = flight.find('status').text
+                dep = flight.find('departure').text
+                arr = flight.find('arrival').text
+                return f"Flight {flight_num} on {xml_date}: Status is {status}. Departure: {dep}, Arrival: {arr}."
+        
+        return f"No record found for flight {flight_num} on the requested date."
+    except Exception as e:
+        return f"Error reading XML: {str(e)}"
+
+# --- 4. OPENAI AGENT ORCHESTRATOR ---
 
 
-def run_openai_agent(user_input):
-    # Tool definition for OpenAI format
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "search_baggage_policy",
-            "description": "Get detailed baggage and luggage rules from the PAA PDF policy.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "The search term"}},
-                "required": ["query"]
+
+def run_agent(user_input):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_baggage_policy",
+                "description": "Get baggage weight limits and airport rules from the PDF.",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_flight_status",
+                "description": "Check flight status, departure, and arrival from the XML records.",
+                "parameters": {
+                    "type": "object", 
+                    "properties": {
+                        "flight_num": {"type": "string", "description": "e.g., SV726"},
+                        "date": {"type": "string", "description": "Optional date e.g., 11 Nov 2025"}
+                    },
+                    "required": ["flight_num"]
+                }
             }
         }
-    }]
+    ]
 
     messages = [
-        {"role": "system", "content": "You are a professional PAA Supervisor. Use the provided search tool to get facts from the PDF before answering. Be polite and helpful."},
+        {"role": "system", "content": "You are a PAA expert. Use 'search_baggage_policy' for luggage queries and 'get_flight_status' for flight info from XML. Always provide data-driven answers."},
         {"role": "user", "content": user_input}
     ]
 
-    try:
-        # Step 1: Pehli call OpenAI ko tool decide karne ke liye
-        response = client_openai.chat.completions.create(
-            model="gpt-4o-mini", # Sasta aur behtreen
-            messages=messages,
-            tools=tools,
-            tool_choice="auto"
-        )
+    response = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=tools)
+    msg = response.choices[0].message
 
-        response_message = response.choices[0].message
-        tool_calls = response_message.tool_calls
-
-        # Step 2: Agar OpenAI ko data chahiye tool se
-        if tool_calls:
-            messages.append(response_message)
+    if msg.tool_calls:
+        messages.append(msg)
+        for tool_call in msg.tool_calls:
+            name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
             
-            for tool_call in tool_calls:
-                function_args = json.loads(tool_call.function.arguments)
-                # Tool ko execute karein
-                function_response = search_baggage_policy(function_args.get("query"))
-                
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": "search_baggage_policy",
-                    "content": function_response,
-                })
+            if name == "search_baggage_policy":
+                result = search_baggage_policy(args['query'])
+            elif name == "get_flight_status":
+                result = get_flight_status(args.get('flight_num'), args.get('date'))
             
-            # Step 3: Final response with data
-            second_response = client_openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-            )
-            return second_response.choices[0].message.content
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": name, "content": result})
         
-        return response_message.content
+        final_res = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
+        return final_res.choices[0].message.content
+    
+    return msg.content
 
-    except Exception as e:
-        return f"OpenAI Error: {str(e)}"
-
-# --- 5. STREAMLIT UI ---
-st.set_page_config(page_title="PAA OpenAI Agent", page_icon="✈️")
-st.title("✈️ PAA Agentic AI (Powered by OpenAI)")
+# --- 5. UI ---
+st.set_page_config(page_title="PAA Multi-Tool Agent", page_icon="✈️")
+st.title("✈️ PAA Intelligent Agent (PDF + XML)")
 
 w_client = get_weaviate_client()
 ingest_data(w_client)
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Asalam-o-Alaikum! How can I help you with PAA services today?"}]
+    st.session_state.messages = [{"role": "assistant", "content": "Asalam-o-Alaikum! Ask me about SV726 status or baggage policies."}]
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Ask about baggage weight or rules..."):
+if prompt := st.chat_input("Check status of SV726 on 11 Nov..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     
-    with st.spinner("AI is retrieving policy details..."):
-        ans = run_openai_agent(prompt)
+    with st.spinner("Agent is checking records..."):
+        ans = run_agent(prompt)
         with st.chat_message("assistant"): st.markdown(ans)
         st.session_state.messages.append({"role": "assistant", "content": ans})
