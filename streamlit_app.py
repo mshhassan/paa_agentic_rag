@@ -35,27 +35,18 @@ EMBEDDING_MODEL, W_CLIENT = load_resources()
 # --- 2. IMPROVED SUB-AGENTS ---
 
 def flight_inquiry_agent(query):
-    """Sub-Agent: AODB Expert using Hybrid Search for better accuracy."""
-    with st.status(f"✈️ Searching AODB for: {query}", expanded=False):
-        coll = W_CLIENT.collections.get("PAAFlightStatus")
-        
-        # Flight Number Extraction for precise keyword matching
-        match = re.search(r'([A-Z]{1,2}\d{2,4})', query.upper())
-        flight_id = match.group(1) if match else query
-
-        # Hybrid search combines Vector (semantic) + BM25 (keyword)
-        response = coll.query.hybrid(
-            query=flight_id, # Exact flight number keyword
-            vector=EMBEDDING_MODEL.encode(query).tolist(), # Semantic context
-            limit=5,
-            alpha=0.25 # Give more weight to Keyword (BM25) over Vector
-        )
-        
-        if not response.objects:
-            return "No flight records found for " + flight_id
-        
-        return "\n".join([o.properties.get('content', '') for o in response.objects])
-        
+    """Sub-Agent: AODB Specialist"""
+    query_vector = EMBEDDING_MODEL.encode(query).tolist()
+    coll = W_CLIENT.collections.get("PAAFlightStatus")
+    
+    # Exact flight number match is crucial for AODB
+    match = re.search(r'([A-Z]{2}\d{2,4})', query.upper())
+    f_filter = Filter.by_property("flight_num").equal(match.group(1)) if match else None
+    
+    response = coll.query.near_vector(near_vector=query_vector, limit=5, filters=f_filter)
+    if not response.objects:
+        return "DATABASE_EMPTY: No specific flight record found for this query."
+    return "\n".join([o.properties.get('content', '') for o in response.objects])
 
 def policy_documentation_agent(query):
     """Sub-Agent: PDF Policy Expert (Baggage, NOTAMs, Lost & Found)"""
