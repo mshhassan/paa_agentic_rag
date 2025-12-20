@@ -32,33 +32,35 @@ def load_resources():
 
 EMBEDDING_MODEL, W_CLIENT = load_resources()
 
-# --- 2. SUB-AGENTS (The "Workers") ---
+# --- 2. IMPROVED SUB-AGENTS ---
 
 def flight_inquiry_agent(query):
-    """Sub-Agent: AODB XML Expert - Using ISO Date Format"""
+    """Sub-Agent: AODB Specialist"""
     query_vector = EMBEDDING_MODEL.encode(query).tolist()
     coll = W_CLIENT.collections.get("PAAFlightStatus")
     
-    # Priority search for Flight Number
+    # Exact flight number match is crucial for AODB
     match = re.search(r'([A-Z]{2}\d{2,4})', query.upper())
     f_filter = Filter.by_property("flight_num").equal(match.group(1)) if match else None
     
     response = coll.query.near_vector(near_vector=query_vector, limit=5, filters=f_filter)
-    return "\n".join([o.properties.get('content', '') for o in response.objects]) if response.objects else "No flight records found."
+    if not response.objects:
+        return "DATABASE_EMPTY: No specific flight record found for this query."
+    return "\n".join([o.properties.get('content', '') for o in response.objects])
 
 def policy_documentation_agent(query):
-    """Sub-Agent: PDF Policy Expert (Baggage/Claims)"""
+    """Sub-Agent: PDF Policy Expert (Baggage, NOTAMs, Lost & Found)"""
     query_vector = EMBEDDING_MODEL.encode(query).tolist()
     coll = W_CLIENT.collections.get("PAAPolicy")
-    response = coll.query.near_vector(near_vector=query_vector, limit=3)
-    return "\n".join([o.properties.get('content', '') for o in response.objects]) if response.objects else "No policy documents found."
+    # Increase limit to capture more context
+    response = coll.query.near_vector(near_vector=query_vector, limit=5)
+    return "\n".join([o.properties.get('content', '') for o in response.objects]) if response.objects else "No documents found."
 
 def web_query_agent(query):
-    """Sub-Agent: Web Links (Lost & Found, Contact, etc.)"""
+    """Sub-Agent: Web URL Expert"""
     query_vector = EMBEDDING_MODEL.encode(query).tolist()
     coll = W_CLIENT.collections.get("PAAWebLink")
-    # Using broader search for links
-    response = coll.query.near_vector(near_vector=query_vector, limit=5)
+    response = coll.query.near_vector(near_vector=query_vector, limit=8)
     
     links = []
     for o in response.objects:
@@ -66,61 +68,38 @@ def web_query_agent(query):
         text = o.properties.get('content', '')
         links.append(f"🔗 [{text}]({url})")
     
-    return "\n".join(links) if links else "No relevant web links found."
+    return "\n".join(links) if links else "No web links found."
 
-# --- 3. PARALLEL EXECUTION HANDLER ---
-
-def execute_parallel(tool_calls):
-    agent_map = {
-        "flight_inquiry_agent": (flight_inquiry_agent, "✈️ Flight Agent"),
-        "policy_documentation_agent": (policy_documentation_agent, "📄 Policy Agent"),
-        "web_query_agent": (web_query_agent, "🌐 Web Agent")
-    }
-    
-    results = []
-    with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(agent_map[tc.function.name][0], json.loads(tc.function.arguments).get('query')): tc for tc in tool_calls}
-        for future in futures:
-            tc = futures[future]
-            try:
-                data = future.result()
-                results.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": data})
-                st.write(f"✅ {agent_map[tc.function.name][1]} has processed data.")
-            except Exception as e:
-                results.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": f"Error: {str(e)}"})
-    return results
-
-# --- 4. MASTER SUPERVISOR ---
+# --- 3. MASTER SUPERVISOR ---
 
 def supervisor_agent(user_input):
     tools = [
         {"type": "function", "function": {
             "name": "flight_inquiry_agent", 
-            "description": "Get flight status. Format query as 'Flight [No] on [YYYY-MM-DD]'. Example: SV726 on 2025-11-11.",
+            "description": "Get flight timings. Reformat date to YYYY-MM-DD.",
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }},
         {"type": "function", "function": {
             "name": "policy_documentation_agent", 
-            "description": "Baggage rules, lost bags, and airport policies.",
+            "description": "Baggage rules, NOTAMs, and Lost & Found procedures.",
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }},
         {"type": "function", "function": {
             "name": "web_query_agent", 
-            "description": "Official PAA links for Lost and Found, Contact Us, and Information.",
+            "description": "Official PAA links for NOTAMs and Lost and Found.",
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }}
     ]
 
-    # Critical Instructions for Reformatting and Logic
-    system_msg = """You are the PAA Master Supervisor. 
-    1. WEATHER: Provide current or typical weather based on your training data immediately. Do not use tools for weather.
-    2. REFORMATTING: User dates (e.g., 11 Nov) MUST be changed to ISO (2025-11-11) for the flight tool.
-    3. LOST & FOUND: If a user mentions lost items, you MUST call 'web_query_agent' with query 'lost and found' AND 'policy_documentation_agent'.
-    4. PARALLEL: Use multiple tools if the user asks multiple things.
-    Current Date: Dec 21, 2025."""
+    system_msg = """You are the PAA Master Supervisor.
+    1. WEATHER: Provide typical weather from your own knowledge.
+    2. FLIGHTS: Always reformat dates to ISO format.
+    3. SEARCH LOGIC: If a user asks for 'NOTAMs' or 'Lost and Found', you MUST call 'web_query_agent' AND 'policy_documentation_agent' with the EXACT keywords 'NOTAM' or 'Lost and Found'.
+    4. LINKS: If the web agent returns links, display them as clickable Markdown links.
+    Today is Dec 21, 2025."""
 
     messages = [{"role": "system", "content": system_msg}]
-    for m in st.session_state.messages[-8:]:
+    for m in st.session_state.messages[-6:]:
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": user_input})
 
@@ -129,17 +108,27 @@ def supervisor_agent(user_input):
 
     if msg.tool_calls:
         messages.append(msg)
-        with st.status("🤖 Supervisor Orchestrating Parallel Agents...", expanded=True):
-            tool_outputs = execute_parallel(msg.tool_calls)
-            messages.extend(tool_outputs)
+        with st.status("🤖 Supervisor Delegating Parallel Tasks...", expanded=True):
+            agent_map = {
+                "flight_inquiry_agent": flight_inquiry_agent,
+                "policy_documentation_agent": policy_documentation_agent,
+                "web_query_agent": web_query_agent
+            }
+            
+            with ThreadPoolExecutor() as executor:
+                futures = {executor.submit(agent_map[tc.function.name], json.loads(tc.function.arguments).get('query')): tc for tc in msg.tool_calls}
+                for future in futures:
+                    tc = futures[future]
+                    result = future.result()
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": result})
         
         final_res = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
         return final_res.choices[0].message.content
     
     return msg.content
 
-# --- 5. STREAMLIT UI ---
-st.set_page_config(page_title="PAA Intelligent Supervisor", layout="wide")
+# --- 4. STREAMLIT UI ---
+st.set_page_config(page_title="PAA Master Agent", layout="wide")
 st.title("🏢 PAA Intelligent Master Agent")
 
 
@@ -150,7 +139,7 @@ if "messages" not in st.session_state:
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Ex: Status of SV726 and how to report a lost bag?"):
+if prompt := st.chat_input("Ex: Show me the link for NOTAMs and flight SV726?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     with st.chat_message("assistant"):
