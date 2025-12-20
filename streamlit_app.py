@@ -10,6 +10,7 @@ from pypdf import PdfReader
 import xml.etree.ElementTree as ET
 import os
 import json
+import re
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -19,7 +20,6 @@ try:
     WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud" 
     WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"] 
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"] 
-    
     client_openai = OpenAI(api_key=OPENAI_API_KEY)
 except KeyError as e:
     st.error(f"Secret Missing: {e}")
@@ -59,9 +59,10 @@ def ingest_data(_client):
             col.data.insert_many(objs)
     return True
 
-# --- 3. UPDATED TOOLS (Robust XML Matching) ---
+# --- 3. UPDATED TOOLS (Super Flexible XML + RAG) ---
 
 def query_knowledge_base(query: str):
+    """Searches Weaviate for PDF/Web policy info."""
     client = get_weaviate_client()
     results = []
     for col_name in ["PAAPolicy", "PAAWeb"]:
@@ -71,7 +72,7 @@ def query_knowledge_base(query: str):
     return "\n".join(results) if results else "No policy found."
 
 def get_flight_status_from_xml(flight_num: str, travel_date: str = None):
-    """Parses XML with robust date and flight number matching."""
+    """Parses XML with robust Regular Expression matching."""
     if not os.path.exists("flight_records.xml"):
         return "Error: flight_records.xml not found."
     
@@ -79,30 +80,34 @@ def get_flight_status_from_xml(flight_num: str, travel_date: str = None):
         tree = ET.parse("flight_records.xml")
         root = tree.getroot()
         
+        # Normalize Flight Number (726 -> SV726)
         target_f = flight_num.strip().upper()
-        # Normalizing input date: "11Nov-25" -> "11nov"
-        target_d = travel_date.lower().replace(" ", "").replace("-", "").replace("/", "") if travel_date else ""
-        if len(target_d) > 5: target_d = target_d[:5] # Focus on Day and Month
+        if not target_f.startswith('SV'): target_f = f"SV{target_f}"
+        
+        # Normalize Date (11Nov-25 -> 11nov)
+        target_d = ""
+        if travel_date:
+            target_d = re.sub(r'[^a-zA-Z0-9]', '', travel_date.lower())
 
         for flight in root.findall('flight'):
             xml_num = flight.find('number').text.strip().upper()
             xml_date = flight.find('date').text.strip().lower()
-            clean_xml_date = xml_date.replace(" ", "").replace("-", "").replace("/", "")
+            clean_xml_date = re.sub(r'[^a-zA-Z0-9]', '', xml_date)
             
-            if target_f in xml_num:
-                # Flexible date match
-                if not target_d or (target_d in clean_xml_date):
+            if target_f == xml_num:
+                # Flexible date match: check if first 5 chars (like '11nov') match
+                if not target_d or (target_d[:5] in clean_xml_date):
                     status = flight.find('status').text
                     dep = flight.find('departure').text
                     arr = flight.find('arrival').text
                     full_date = flight.find('date').text
                     return f"✅ **Flight Found:** {xml_num} on {full_date}\n- **Status:** {status}\n- **Dep:** {dep} | **Arr:** {arr}"
         
-        return f"❌ No record for {flight_num} on {travel_date} in XML records."
+        return f"❌ No record for {target_f} on {travel_date} in XML."
     except Exception as e:
-        return f"XML Error: {str(e)}"
+        return f"XML Parser Error: {str(e)}"
 
-# --- 4. AGENT LOGIC ---
+# --- 4. AGENT LOGIC (With Memory) ---
 
 def run_agent(user_input):
     tools = [
@@ -110,7 +115,7 @@ def run_agent(user_input):
             "type": "function",
             "function": {
                 "name": "query_knowledge_base",
-                "description": "Baggage and PAA policy info.",
+                "description": "Use for baggage weight, liquid rules, and general PAA policy.",
                 "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
             }
         },
@@ -118,7 +123,7 @@ def run_agent(user_input):
             "type": "function",
             "function": {
                 "name": "get_flight_status_from_xml",
-                "description": "Flight status from XML.",
+                "description": "Use for real-time flight status, timing, and date checks from XML.",
                 "parameters": {
                     "type": "object", 
                     "properties": {
@@ -131,10 +136,15 @@ def run_agent(user_input):
         }
     ]
 
-    messages = [
-        {"role": "system", "content": "You are a PAA Supervisor. For flight status, extract flight number and date for the tool. Use 'get_flight_status_from_xml'."},
-        {"role": "user", "content": user_input}
-    ]
+    # Initialize messages with System Prompt + Chat History
+    messages = [{"role": "system", "content": "You are a PAA Agent. Maintain context. If a flight number was mentioned earlier, use it. Always try to match flight numbers with 'SV' prefix. For baggage, use Weaviate tool."}]
+    
+    # Add history from session state
+    for m in st.session_state.messages:
+        messages.append({"role": m["role"], "content": m["content"]})
+    
+    # Add new user input
+    messages.append({"role": "user", "content": user_input})
 
     response = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=tools)
     msg = response.choices[0].message
@@ -143,33 +153,38 @@ def run_agent(user_input):
         messages.append(msg)
         for tool_call in msg.tool_calls:
             args = json.loads(tool_call.function.arguments)
-            if tool_call.function.name == "query_knowledge_base":
+            name = tool_call.function.name
+            
+            if name == "query_knowledge_base":
                 res = query_knowledge_base(args['query'])
             else:
                 res = get_flight_status_from_xml(args.get('flight_num'), args.get('travel_date'))
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": res})
+                
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": name, "content": res})
         
         final = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
         return final.choices[0].message.content
     return msg.content
 
 # --- 5. UI ---
-st.set_page_config(page_title="PAA Unified Agent")
-st.title("🇵🇰 PAA Agent (PDF + XML)")
+st.set_page_config(page_title="PAA Unified Agent", page_icon="🇵🇰")
+st.title("🇵🇰 PAA Intelligent Agent")
 
 w_client = get_weaviate_client()
 ingest_data(w_client)
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Asalam-o-Alaikum! How can I help you today?"}]
+    st.session_state.messages = []
 
+# Display chat history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Flight status of SV726 on 11Nov..."):
+if prompt := st.chat_input("Check SV726 status or baggage policy..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
-    with st.spinner("Searching records..."):
+    
+    with st.spinner("Processing..."):
         ans = run_agent(prompt)
-        with st.chat_message("assistant"): st.markdown(ans)
         st.session_state.messages.append({"role": "assistant", "content": ans})
+        with st.chat_message("assistant"): st.markdown(ans)
