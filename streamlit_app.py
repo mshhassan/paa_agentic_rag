@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 import os
 import json
 import re
+from datetime import datetime
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -22,7 +23,7 @@ try:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"] 
     client_openai = OpenAI(api_key=OPENAI_API_KEY)
 except KeyError as e:
-    st.error(f"Secret Missing: {e}")
+    st.error(f"Secret Missing: {e}. Please add WEAVIATE_API_KEY and OPENAI_API_KEY in Secrets.")
     st.stop()
 
 @st.cache_resource
@@ -38,13 +39,12 @@ def get_weaviate_client():
         cluster_url=WEAVIATE_URL, 
         auth_credentials=Auth.api_key(WEAVIATE_KEY)
     )
-    for col_name in ["PAAPolicy", "PAAWeb"]:
-        if not client.collections.exists(col_name):
-            client.collections.create(
-                name=col_name,
-                vectorizer_config=Configure.Vectorizer.none(),
-                properties=[Property(name="content", data_type=DataType.TEXT)]
-            )
+    if not client.collections.exists("PAAPolicy"):
+        client.collections.create(
+            name="PAAPolicy",
+            vectorizer_config=Configure.Vectorizer.none(),
+            properties=[Property(name="content", data_type=DataType.TEXT)]
+        )
     return client
 
 @st.cache_resource
@@ -59,91 +59,77 @@ def ingest_data(_client):
             col.data.insert_many(objs)
     return True
 
-# --- 3. UPDATED TOOLS (Super Flexible XML + RAG) ---
-
-def query_knowledge_base(query: str):
-    """Searches Weaviate for PDF/Web policy info."""
-    client = get_weaviate_client()
-    results = []
-    for col_name in ["PAAPolicy", "PAAWeb"]:
-        col = client.collections.get(col_name)
-        res = col.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=2)
-        results.extend([o.properties['content'] for o in res.objects])
-    return "\n".join(results) if results else "No policy found."
+# --- 3. UPDATED ROBUST XML TOOL ---
 
 def get_flight_status_from_xml(flight_num: str, travel_date: str = None):
-    """Parses XML with robust Regular Expression matching."""
+    """Parses XML with multi-layer matching for flight and date."""
     if not os.path.exists("flight_records.xml"):
-        return "Error: flight_records.xml not found."
+        return "System Error: flight_records.xml not found."
     
     try:
         tree = ET.parse("flight_records.xml")
         root = tree.getroot()
         
-        # Normalize Flight Number (726 -> SV726)
+        # 1. Flight Number Normalization (726 -> SV726)
         target_f = flight_num.strip().upper()
-        if not target_f.startswith('SV'): target_f = f"SV{target_f}"
+        if not target_f.startswith('SV') and len(target_f) <= 4:
+            target_f = f"SV{target_f}"
         
-        # Normalize Date (11Nov-25 -> 11nov)
-        target_d = ""
+        # 2. Date Normalization (11Nov-25 -> 11nov)
+        target_d_clean = ""
         if travel_date:
-            target_d = re.sub(r'[^a-zA-Z0-9]', '', travel_date.lower())
+            target_d_clean = re.sub(r'[^a-zA-Z0-9]', '', travel_date.lower())
+            # "11nov25" -> "11nov" (taking only day and month for safety)
+            if len(target_d_clean) > 5: target_d_clean = target_d_clean[:5]
 
         for flight in root.findall('flight'):
             xml_num = flight.find('number').text.strip().upper()
-            xml_date = flight.find('date').text.strip().lower()
-            clean_xml_date = re.sub(r'[^a-zA-Z0-9]', '', xml_date)
+            xml_date_raw = flight.find('date').text.strip()
+            xml_date_clean = re.sub(r'[^a-zA-Z0-9]', '', xml_date_raw.lower())
             
-            if target_f == xml_num:
-                # Flexible date match: check if first 5 chars (like '11nov') match
-                if not target_d or (target_d[:5] in clean_xml_date):
+            # Match Flight Number
+            if target_f == xml_num or target_f in xml_num:
+                # Match Date (if provided)
+                if not target_d_clean or (target_d_clean in xml_date_clean):
                     status = flight.find('status').text
                     dep = flight.find('departure').text
                     arr = flight.find('arrival').text
-                    full_date = flight.find('date').text
-                    return f"✅ **Flight Found:** {xml_num} on {full_date}\n- **Status:** {status}\n- **Dep:** {dep} | **Arr:** {arr}"
+                    return (f"✅ **Flight Status Verified:**\n"
+                            f"- **Flight:** {xml_num}\n"
+                            f"- **Date:** {xml_date_raw}\n"
+                            f"- **Status:** {status}\n"
+                            f"- **Schedule:** {dep} to {arr}")
         
-        return f"❌ No record for {target_f} on {travel_date} in XML."
+        return f"❌ No record found in XML for Flight {target_f} on {travel_date}."
     except Exception as e:
-        return f"XML Parser Error: {str(e)}"
+        return f"Internal XML Error: {str(e)}"
 
-# --- 4. AGENT LOGIC (With Memory) ---
+# --- 4. AGENT LOGIC (Memory + Context) ---
 
 def run_agent(user_input):
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "query_knowledge_base",
-                "description": "Use for baggage weight, liquid rules, and general PAA policy.",
-                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_flight_status_from_xml",
-                "description": "Use for real-time flight status, timing, and date checks from XML.",
-                "parameters": {
-                    "type": "object", 
-                    "properties": {
-                        "flight_num": {"type": "string"},
-                        "travel_date": {"type": "string"}
-                    }, 
-                    "required": ["flight_num"]
-                }
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_flight_status_from_xml",
+            "description": "Check flight status using number (SV726) and date (11 Nov).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flight_num": {"type": "string"},
+                    "travel_date": {"type": "string"}
+                },
+                "required": ["flight_num"]
             }
         }
-    ]
+    }]
 
-    # Initialize messages with System Prompt + Chat History
-    messages = [{"role": "system", "content": "You are a PAA Agent. Maintain context. If a flight number was mentioned earlier, use it. Always try to match flight numbers with 'SV' prefix. For baggage, use Weaviate tool."}]
+    # System instruction with strict history focus
+    messages = [{"role": "system", "content": "You are a PAA expert. Today is Dec 2025. Use 'get_flight_status_from_xml' for ALL flight status queries. Remember previous flight numbers if the user only provides a date later."}]
     
-    # Add history from session state
+    # Add history
     for m in st.session_state.messages:
         messages.append({"role": m["role"], "content": m["content"]})
     
-    # Add new user input
     messages.append({"role": "user", "content": user_input})
 
     response = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=tools)
@@ -153,38 +139,33 @@ def run_agent(user_input):
         messages.append(msg)
         for tool_call in msg.tool_calls:
             args = json.loads(tool_call.function.arguments)
-            name = tool_call.function.name
-            
-            if name == "query_knowledge_base":
-                res = query_knowledge_base(args['query'])
-            else:
-                res = get_flight_status_from_xml(args.get('flight_num'), args.get('travel_date'))
-                
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": name, "content": res})
+            result = get_flight_status_from_xml(args.get('flight_num'), args.get('travel_date'))
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": "get_flight_status_from_xml", "content": result})
         
         final = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
         return final.choices[0].message.content
     return msg.content
 
 # --- 5. UI ---
-st.set_page_config(page_title="PAA Unified Agent", page_icon="🇵🇰")
-st.title("🇵🇰 PAA Intelligent Agent")
+st.set_page_config(page_title="PAA Unified Agent", page_icon="✈️")
+st.title("✈️ PAA Intelligent Agent")
 
+# Ingest data on load
 w_client = get_weaviate_client()
 ingest_data(w_client)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display chat history
+# Show history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Check SV726 status or baggage policy..."):
+if prompt := st.chat_input("E.g., What is the status of SV726 on 11 Nov?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     
-    with st.spinner("Processing..."):
+    with st.spinner("Checking records..."):
         ans = run_agent(prompt)
         st.session_state.messages.append({"role": "assistant", "content": ans})
         with st.chat_message("assistant"): st.markdown(ans)
