@@ -7,6 +7,8 @@ from weaviate.classes.data import DataObject
 from sentence_transformers import SentenceTransformer 
 from langchain_text_splitters import RecursiveCharacterTextSplitter 
 from pypdf import PdfReader
+from bs4 import BeautifulSoup
+import requests
 import xml.etree.ElementTree as ET
 import os
 import json
@@ -22,7 +24,7 @@ try:
     
     client_openai = OpenAI(api_key=OPENAI_API_KEY)
 except KeyError as e:
-    st.error(f"Secret Missing: {e}. Please add OPENAI_API_KEY in Streamlit Secrets.")
+    st.error(f"Secret Missing: {e}. Please ensure WEAVIATE_API_KEY and OPENAI_API_KEY are in secrets.")
     st.stop()
 
 @st.cache_resource
@@ -38,101 +40,101 @@ def get_weaviate_client():
         cluster_url=WEAVIATE_URL, 
         auth_credentials=Auth.api_key(WEAVIATE_KEY)
     )
-    if not client.collections.exists("PAAPolicy"):
-        client.collections.create(
-            name="PAAPolicy",
-            vectorizer_config=Configure.Vectorizer.none(),
-            properties=[Property(name="content", data_type=DataType.TEXT)]
-        )
+    # Create Collections if they don't exist
+    for col_name in ["PAAPolicy", "PAAWeb"]:
+        if not client.collections.exists(col_name):
+            client.collections.create(
+                name=col_name,
+                vectorizer_config=Configure.Vectorizer.none(),
+                properties=[Property(name="content", data_type=DataType.TEXT)]
+            )
     return client
 
-@st.cache_resource(show_spinner="Ingesting Policy Data...")
+@st.cache_resource(show_spinner="Ingesting Knowledge Base...")
 def ingest_data(_client):
+    # 1. Process PDF
     if os.path.exists("policy_baggage.pdf"):
-        reader = PdfReader("policy_baggage.pdf")
-        text = "".join([p.extract_text() for p in reader.pages])
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = splitter.split_text(text)
-        
-        collection = _client.collections.get("PAAPolicy")
-        count = collection.aggregate.over_all(total_count=True).total_count
-        if count == 0:
+        col = _client.collections.get("PAAPolicy")
+        if col.aggregate.over_all(total_count=True).total_count == 0:
+            reader = PdfReader("policy_baggage.pdf")
+            text = "".join([p.extract_text() for p in reader.pages])
+            chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(text)
             objs = [DataObject(properties={"content": c}, vector=EMBEDDING_MODEL.encode(c).tolist()) for c in chunks]
-            collection.data.insert_many(objs)
+            col.data.insert_many(objs)
+
+    # 2. Process Web (Scraping example)
+    col_web = _client.collections.get("PAAWeb")
+    if col_web.aggregate.over_all(total_count=True).total_count == 0:
+        try:
+            url = "https://paa.gov.pk/"
+            res = requests.get(url, timeout=10, verify=False)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            web_text = soup.get_text(separator=' ', strip=True)
+            chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(web_text)
+            objs = [DataObject(properties={"content": c}, vector=EMBEDDING_MODEL.encode(c).tolist()) for c in chunks]
+            col_web.data.insert_many(objs)
+        except: pass
     return True
 
-# --- 3. TOOLS (PDF & XML) ---
+# --- 3. TOOLS (PDF, WEB & XML) ---
 
-def search_baggage_policy(query: str):
-    """Searches the PAA baggage policy PDF."""
-    w_client = get_weaviate_client()
-    col = w_client.collections.get("PAAPolicy")
-    res = col.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=2)
-    return "\n".join([o.properties['content'] for o in res.objects]) if res.objects else "No policy found."
+def query_knowledge_base(query: str):
+    """Searches PDF and Web data in Weaviate for general PAA rules/policies."""
+    client = get_weaviate_client()
+    results = []
+    for col_name in ["PAAPolicy", "PAAWeb"]:
+        col = client.collections.get(col_name)
+        res = col.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=2)
+        results.extend([o.properties['content'] for o in res.objects])
+    return "\n".join(results) if results else "No specific policy found."
 
-def get_flight_status(flight_num: str, date: str = None):
-    """Parses flight_records.xml to find the status of a specific flight."""
+def get_flight_status_from_xml(flight_num: str):
+    """Directly parses flight_records.xml for 100% accurate flight status."""
     if not os.path.exists("flight_records.xml"):
-        return "Flight records file not found."
+        return "Flight records file (XML) is missing."
     
     try:
         tree = ET.parse("flight_records.xml")
         root = tree.getroot()
-        
-        # Flight number clean-up (e.g., SV726)
         flight_num = flight_num.strip().upper()
         
         for flight in root.findall('flight'):
-            xml_flight_num = flight.find('number').text.strip().upper()
-            xml_date = flight.find('date').text.strip()
-            
-            if xml_flight_num == flight_num:
-                # Agar date di gayi hai toh match karo, warna flight number se return karo
-                if date and date not in xml_date:
-                    continue
-                
+            xml_num = flight.find('number').text.strip().upper()
+            if flight_num in xml_num:
                 status = flight.find('status').text
                 dep = flight.find('departure').text
                 arr = flight.find('arrival').text
-                return f"Flight {flight_num} on {xml_date}: Status is {status}. Departure: {dep}, Arrival: {arr}."
+                date = flight.find('date').text
+                return f"FOUND IN XML: Flight {xml_num} on {date} is {status}. Dep: {dep}, Arr: {arr}."
         
-        return f"No record found for flight {flight_num} on the requested date."
+        return f"Flight {flight_num} not found in flight_records.xml."
     except Exception as e:
-        return f"Error reading XML: {str(e)}"
+        return f"XML Error: {str(e)}"
 
-# --- 4. OPENAI AGENT ORCHESTRATOR ---
-
-
+# --- 4. AGENT ORCHESTRATOR ---
 
 def run_agent(user_input):
     tools = [
         {
             "type": "function",
             "function": {
-                "name": "search_baggage_policy",
-                "description": "Get baggage weight limits and airport rules from the PDF.",
+                "name": "query_knowledge_base",
+                "description": "Get baggage policy and general PAA information from PDF/Web.",
                 "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
             }
         },
         {
             "type": "function",
             "function": {
-                "name": "get_flight_status",
-                "description": "Check flight status, departure, and arrival from the XML records.",
-                "parameters": {
-                    "type": "object", 
-                    "properties": {
-                        "flight_num": {"type": "string", "description": "e.g., SV726"},
-                        "date": {"type": "string", "description": "Optional date e.g., 11 Nov 2025"}
-                    },
-                    "required": ["flight_num"]
-                }
+                "name": "get_flight_status_from_xml",
+                "description": "Check real-time flight status, departure/arrival from XML records.",
+                "parameters": {"type": "object", "properties": {"flight_num": {"type": "string"}}, "required": ["flight_num"]}
             }
         }
     ]
 
     messages = [
-        {"role": "system", "content": "You are a PAA expert. Use 'search_baggage_policy' for luggage queries and 'get_flight_status' for flight info from XML. Always provide data-driven answers."},
+        {"role": "system", "content": "You are a PAA Supervisor. For flight status, ALWAYS use 'get_flight_status_from_xml'. For baggage/rules, use 'query_knowledge_base'."},
         {"role": "user", "content": user_input}
     ]
 
@@ -145,10 +147,10 @@ def run_agent(user_input):
             name = tool_call.function.name
             args = json.loads(tool_call.function.arguments)
             
-            if name == "search_baggage_policy":
-                result = search_baggage_policy(args['query'])
-            elif name == "get_flight_status":
-                result = get_flight_status(args.get('flight_num'), args.get('date'))
+            if name == "query_knowledge_base":
+                result = query_knowledge_base(args['query'])
+            elif name == "get_flight_status_from_xml":
+                result = get_flight_status_from_xml(args['flight_num'])
             
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": name, "content": result})
         
@@ -158,23 +160,23 @@ def run_agent(user_input):
     return msg.content
 
 # --- 5. UI ---
-st.set_page_config(page_title="PAA Multi-Tool Agent", page_icon="✈️")
-st.title("✈️ PAA Intelligent Agent (PDF + XML)")
+st.set_page_config(page_title="PAA Unified Agent", page_icon="🇵🇰")
+st.title("🇵🇰 PAA Agent (PDF + XML + Web)")
 
 w_client = get_weaviate_client()
 ingest_data(w_client)
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Asalam-o-Alaikum! Ask me about SV726 status or baggage policies."}]
+    st.session_state.messages = [{"role": "assistant", "content": "How can I help you with PAA services today?"}]
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Check status of SV726 on 11 Nov..."):
+if prompt := st.chat_input("Check status of SV726..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     
-    with st.spinner("Agent is checking records..."):
+    with st.spinner("Agent searching all sources..."):
         ans = run_agent(prompt)
         with st.chat_message("assistant"): st.markdown(ans)
         st.session_state.messages.append({"role": "assistant", "content": ans})
