@@ -76,37 +76,45 @@ def query_knowledge_base(query: str):
     return "\n".join(results) if results else "No policy found."
 
 def get_flight_status_from_xml(flight_num: str, travel_date: str = None):
-    """Directly parses flight_records.xml for flight status."""
+    """Directly parses flight_records.xml for flight status with flexible matching."""
     if not os.path.exists("flight_records.xml"):
-        return "Flight records XML file not found in directory."
+        return "Flight records XML file not found."
     
     try:
         tree = ET.parse("flight_records.xml")
         root = tree.getroot()
-        flight_num = flight_num.strip().upper()
+        
+        # Flight number clean-up (e.g., SV726)
+        target_flight = flight_num.strip().upper()
+        
+        # Date clean-up (e.g., 11nov25 -> 11 nov 2025)
+        target_date = ""
+        if travel_date:
+            target_date = travel_date.lower().replace(" ", "")
 
         for flight in root.findall('flight'):
             xml_num = flight.find('number').text.strip().upper()
-            xml_date = flight.find('date').text.strip()
+            xml_date = flight.find('date').text.strip().lower()
             
-            # Match flight number
-            if flight_num in xml_num:
-                # If date is provided, try to match it as well
-                if travel_date:
-                    # Basic check if date mentioned in query exists in XML date field
-                    clean_travel_date = travel_date.lower().replace(" ", "")
-                    clean_xml_date = xml_date.lower().replace(" ", "")
-                    if clean_travel_date not in clean_xml_date:
-                        continue
-
-                status = flight.find('status').text
-                dep = flight.find('departure').text
-                arr = flight.find('arrival').text
-                return f"XML RECORD: Flight {xml_num} on {xml_date} is {status}. Departure: {dep}, Arrival: {arr}."
+            # Agar flight number match ho jaye
+            if target_flight in xml_num:
+                # Agar date query mein hai, toh match check karein
+                if target_date:
+                    clean_xml_date = xml_date.replace(" ", "")
+                    # Check if '11nov' exists in '11 nov 2025'
+                    if target_date[:5] in clean_xml_date: 
+                        status = flight.find('status').text
+                        dep = flight.find('departure').text
+                        arr = flight.find('arrival').text
+                        return f"✅ **Flight Found:** {xml_num} on {flight.find('date').text}.\n- **Status:** {status}\n- **Departure:** {dep}\n- **Arrival:** {arr}"
+                else:
+                    # Agar date nahi di toh pehla match return karein
+                    status = flight.find('status').text
+                    return f"Flight {xml_num} found. Status: {status}. (Please specify date for exact details)."
         
-        return f"Could not find exact match for {flight_num} on {travel_date} in flight_records.xml."
+        return f"❌ No record found for {flight_num} on {travel_date} in the system."
     except Exception as e:
-        return f"XML Parsing Error: {str(e)}"
+        return f"Error reading XML: {str(e)}"
 
 # --- 4. AGENT ORCHESTRATOR ---
 
