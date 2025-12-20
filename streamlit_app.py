@@ -3,7 +3,6 @@ from openai import OpenAI
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter
-import os
 import json
 import re
 import warnings
@@ -11,117 +10,79 @@ from sentence_transformers import SentenceTransformer
 
 warnings.filterwarnings("ignore")
 
-# --- 1. CONFIGURATION ---
+# --- 1. CORE CONFIGURATION ---
 try:
     WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud"
     WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
     client_openai = OpenAI(api_key=OPENAI_API_KEY)
 except KeyError as e:
-    st.error(f"Secret Missing: {e}. Please add them in Streamlit Secrets.")
+    st.error(f"Secret Missing: {e}")
     st.stop()
 
 @st.cache_resource
-def load_models():
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-EMBEDDING_MODEL = load_models()
-
-@st.cache_resource
-def get_weaviate_client():
+def load_resources():
+    model = SentenceTransformer('all-MiniLM-L6-v2')
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=WEAVIATE_URL,
         auth_credentials=Auth.api_key(WEAVIATE_KEY)
     )
-    return client
+    return model, client
 
-# --- 2. IMPROVED SEARCH TOOL ---
+EMBEDDING_MODEL, W_CLIENT = load_resources()
 
-def paa_hybrid_search(query_text: str):
-    """Searches Weaviate with flexible date handling and flight filters."""
-    client = get_weaviate_client()
-    query_vector = EMBEDDING_MODEL.encode(query_text).tolist()
+# --- 2. SPECIALIZED SUB-AGENT FUNCTIONS (RAG TOOLS) ---
+
+def flight_inquiry_agent(query):
+    """Sub-Agent for Flight Status Records."""
+    query_vector = EMBEDDING_MODEL.encode(query).tolist()
+    coll = W_CLIENT.collections.get("PAAFlightStatus")
     
-    results_context = ""
+    # Extract flight ID for filtering
+    match = re.search(r'([A-Z]{2}\d{2,4})', query.upper())
+    filters = Filter.by_property("flight_num").equal(match.group(1)) if match else None
     
-    # Extract Flight Number (e.g., SV726)
-    flight_match = re.search(r'([A-Z]{2}\d{2,4})', query_text.upper())
-    
-    collections = {
-        "PAAFlightStatus": ["content", "flight_num", "status"],
-        "PAAPolicy": ["content", "source"],
-        "PAAWebLink": ["content", "url_href"]
-    }
+    response = coll.query.near_vector(near_vector=query_vector, limit=2, filters=filters)
+    return "\n".join([o.properties['content'] for o in response.objects]) if response.objects else "No flight data found."
 
-    for coll_name, props in collections.items():
-        try:
-            collection = client.collections.get(coll_name)
-            
-            # Specialized Search for Flights
-            if coll_name == "PAAFlightStatus" and flight_match:
-                target_flight = flight_match.group(1)
-                # Try Filter First
-                response = collection.query.near_vector(
-                    near_vector=query_vector,
-                    limit=3,
-                    filters=Filter.by_property("flight_num").equal(target_flight),
-                    return_properties=props
-                )
-                # If filter gives 0 results, fallback to pure Vector Search for that flight
-                if not response.objects:
-                    response = collection.query.near_vector(
-                        near_vector=query_vector,
-                        limit=3,
-                        return_properties=props
-                    )
-            else:
-                # Standard Search for Policies
-                response = collection.query.near_vector(
-                    near_vector=query_vector,
-                    limit=2,
-                    return_properties=props
-                )
+def policy_documentation_agent(query):
+    """Sub-Agent for Baggage & PAA Documentation."""
+    query_vector = EMBEDDING_MODEL.encode(query).tolist()
+    coll = W_CLIENT.collections.get("PAAPolicy")
+    response = coll.query.near_vector(near_vector=query_vector, limit=3)
+    return "\n".join([o.properties['content'] for o in response.objects]) if response.objects else "No policy data found."
 
-            for obj in response.objects:
-                content = obj.properties.get("content", "")
-                results_context += f"\n[Collection: {coll_name}] {content}\n"
-                
-        except Exception as e:
-            continue
+def web_query_agent(query):
+    """Sub-Agent for PAA Website Links & General Info."""
+    query_vector = EMBEDDING_MODEL.encode(query).tolist()
+    coll = W_CLIENT.collections.get("PAAWebLink")
+    response = coll.query.near_vector(near_vector=query_vector, limit=2)
+    return "\n".join([o.properties['content'] for o in response.objects]) if response.objects else "No web links found."
 
-    return results_context if results_context else "No specific records found in database for this query."
+# --- 3. MASTER SUPERVISOR LOGIC ---
 
-# --- 3. AGENT LOGIC ---
-
-def run_paa_agent(user_input):
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "paa_hybrid_search",
-            "description": "Fetch flight status, baggage rules, and PAA policies from the vector database.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query_text": {"type": "string", "description": "The search term including flight number or policy topic."}
-                },
-                "required": ["query_text"]
-            }
-        }
-    }]
-
-    messages = [
-        {"role": "system", "content": "You are the PAA Intelligent Assistant. Use 'paa_hybrid_search' for ALL queries. If a user asks for a flight like SV726 on a specific date, search for it. If the database returns multiple dates, pick the one closest to the user's request. Today is Dec 2025."}
+def supervisor_agent(user_input):
+    # Tool definitions for the Supervisor
+    tools = [
+        {"type": "function", "function": {"name": "flight_inquiry_agent", "description": "Get flight timing, status, and carousel info.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+        {"type": "function", "function": {"name": "policy_documentation_agent", "description": "Get baggage rules, weight limits, and PAA documents.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+        {"type": "function", "function": {"name": "web_query_agent", "description": "Get official PAA website links and contact info.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
     ]
 
+    # Prepare conversation history
+    messages = [{"role": "system", "content": "You are the PAA Master Supervisor. Your job is to delegate tasks to specialized agents. If the user asks something general, reply directly. If it's about flights, baggage, or links, call the appropriate sub-agent(s). You can call multiple agents if needed. Today is Dec 2025."}]
+    
     for m in st.session_state.messages:
         messages.append({"role": m["role"], "content": m["content"]})
     
     messages.append({"role": "user", "content": user_input})
 
+    # Supervisor decides who to call
     response = client_openai.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
-        tools=tools
+        tools=tools,
+        tool_choice="auto"
     )
     
     msg = response.choices[0].message
@@ -129,30 +90,52 @@ def run_paa_agent(user_input):
     if msg.tool_calls:
         messages.append(msg)
         for tool_call in msg.tool_calls:
-            args = json.loads(tool_call.function.arguments)
-            search_result = paa_hybrid_search(args.get('query_text'))
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": "paa_hybrid_search", "content": search_result})
+            func_name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments).get('query')
+            
+            # Routing to Sub-Agents
+            if func_name == "flight_inquiry_agent":
+                result = flight_inquiry_agent(args)
+            elif func_name == "policy_documentation_agent":
+                result = policy_documentation_agent(args)
+            elif func_name == "web_query_agent":
+                result = web_query_agent(args)
+            
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": func_name, "content": result})
         
-        final = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
-        return final.choices[0].message.content
+        # Final synthesis by Supervisor
+        final_res = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
+        return final_res.choices[0].message.content
     
     return msg.content
 
-# --- 4. UI ---
-st.set_page_config(page_title="PAA AI Agent", page_icon="✈️")
-st.title("✈️ PAA Intelligent Assistant")
+# --- 4. STREAMLIT INTERFACE ---
+
+st.set_page_config(page_title="PAA Master Agent", page_icon="🏢", layout="wide")
+
+st.title("🏢 PAA Master Supervisor System")
+st.info("The Supervisor Agent will route your query to specialized Flight, Policy, or Web agents.")
+
+
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]): st.markdown(m["content"])
+# Sidebar for History Clear
+if st.sidebar.button("Clear Conversation"):
+    st.session_state.messages = []
+    st.rerun()
 
-if prompt := st.chat_input("Flight status of SV726?"):
+# Display Chat
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+if prompt := st.chat_input("How much baggage is allowed on SV726?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
 
-    with st.spinner("Accessing Records..."):
-        answer = run_paa_agent(prompt)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"): st.markdown(answer)
+    with st.spinner("Supervisor delegating tasks..."):
+        ans = supervisor_agent(prompt)
+        st.session_state.messages.append({"role": "assistant", "content": ans})
+        with st.chat_message("assistant"): st.markdown(ans)
