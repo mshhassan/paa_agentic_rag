@@ -59,87 +59,94 @@ def ingest_data(_client):
             col.data.insert_many(objs)
     return True
 
-# --- 3. UPDATED ROBUST XML TOOL (NAMESPACE AWARE) ---
+# --- 3. REFACTORED XML TOOL (FIXED FOR MULTI-BLOCK XML) ---
 
 def get_flight_status_from_xml(flight_num: str, travel_date: str = None):
-    """Parses complex Envelope XML with Namespaces for Flight Data."""
+    """Parses multi-envelope XML files by wrapping them in a virtual root."""
     if not os.path.exists("flight_records.xml"):
         return "Error: flight_records.xml not found."
     
     try:
-        tree = ET.parse("flight_records.xml")
-        root = tree.getroot()
+        # Step 1: Read and wrap XML to handle multiple declarations
+        with open("flight_records.xml", "r", encoding="utf-8") as f:
+            raw_content = f.read()
         
-        # XML Namespace (from your data)
+        # Remove extra XML headers and wrap in a single <root>
+        clean_content = re.sub(r'<\?xml.*?\?>', '', raw_content)
+        wrapped_xml = f"<root>{clean_content}</root>"
+        root = ET.fromstring(wrapped_xml)
+        
+        # Namespace mapping
         ns = {'ns': 'http://schema.ultra-as.com'}
         
-        # Normalize Input
+        # Normalize input flight number
         target_f = flight_num.strip().upper()
         if not target_f.startswith('SV'): target_f = f"SV{target_f}"
         
-        # Clean date for comparison (e.g., 2025-11-30)
+        # Clean date for search
         target_d = ""
         if travel_date:
-            # Matches YYYY-MM-DD or MM-DD pattern
-            target_d = re.sub(r'[^0-9-]', '', travel_date)
+            # Extract only numbers (e.g., '11 Nov' -> '11', '2025-11-30' -> '20251130')
+            target_d = re.sub(r'[^0-9]', '', travel_date)
 
-        # Search for AFDSFlightData within the XML
+        # Step 2: Search across all AFDSFlightData blocks
         for flight_node in root.findall('.//ns:AFDSFlightData', ns):
             ident = flight_node.find('ns:FlightIdentification', ns)
             if ident is not None:
                 xml_num = ident.find('ns:FlightIdentity', ns).text.strip().upper()
-                xml_date = ident.find('ns:ScheduledDate', ns).text.strip() # 2025-11-30+05:00
+                xml_date = ident.find('ns:ScheduledDate', ns).text.strip() # e.g. 2025-11-30+05:00
                 
-                # Check Flight Identity
+                # Check Flight Number
                 if target_f == xml_num:
-                    # Check Date (Partial match)
-                    if not target_d or (target_d in xml_date):
-                        # Extract Operational Details
-                        ops = flight_node.find('.//ns:OperationalTimes', ns)
-                        est_time = ops.find('ns:EstimatedDateTime', ns).text if ops is not None else "Not Available"
+                    # Check Date (if user provided one)
+                    # We check if the digits provided by user exist in the XML date
+                    xml_date_digits = re.sub(r'[^0-9]', '', xml_date)
+                    if not target_d or (target_d in xml_date_digits):
                         
-                        # Extract Carousel
+                        # Extract Details
+                        ops = flight_node.find('.//ns:OperationalTimes', ns)
+                        est_time = ops.find('ns:EstimatedDateTime', ns).text if ops is not None else "N/A"
+                        
+                        airport = flight_node.find('.//ns:Airport', ns)
                         carousel = "N/A"
-                        bag_node = flight_node.find('.//ns:BaggageReclaimCarouselID', ns)
-                        if bag_node is not None: carousel = bag_node.text
+                        if airport is not None:
+                            bag = airport.find('.//ns:BaggageReclaimCarouselID', ns)
+                            if bag is not None: carousel = bag.text
 
-                        # Flight Direction
                         direction = ident.find('ns:FlightDirection', ns).text
                         
-                        return (f"✅ **Flight Found (AODB System):**\n"
+                        return (f"✅ **Flight Status Found (AODB):**\n"
                                 f"- **Flight Identity:** {xml_num}\n"
                                 f"- **Direction:** {direction}\n"
                                 f"- **Scheduled Date:** {xml_date}\n"
                                 f"- **Estimated Time:** {est_time}\n"
                                 f"- **Baggage Carousel:** {carousel}")
 
-        return f"❌ No matching record for {target_f} on {travel_date} in the system."
+        return f"❌ No record for {target_f} found for the date {travel_date}."
     except Exception as e:
-        return f"XML System Error: {str(e)}"
+        return f"System XML Error: {str(e)}"
 
-# --- 4. AGENT LOGIC (Memory + Tooling) ---
+# --- 4. AGENT LOGIC ---
 
 def run_agent(user_input):
     tools = [{
         "type": "function",
         "function": {
             "name": "get_flight_status_from_xml",
-            "description": "Checks AODB XML for flight status, timing, and baggage carousel.",
+            "description": "Get real-time flight status and baggage info from XML records.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "flight_num": {"type": "string"},
-                    "travel_date": {"type": "string"}
+                    "flight_num": {"type": "string", "description": "e.g. SV726"},
+                    "travel_date": {"type": "string", "description": "e.g. 11 Nov"}
                 },
                 "required": ["flight_num"]
             }
         }
     }]
 
-    # System instruction: Essential for context keeping
-    messages = [{"role": "system", "content": "You are a PAA Agent. You have access to AODB flight records. If a user provides a flight number first and a date later, remember the flight number from history. Today is late 2025."}]
+    messages = [{"role": "system", "content": "You are a helpful PAA Agent. Use tools for flight status. Remember history. Today is Nov 2025."}]
     
-    # Add history from Streamlit session
     for m in st.session_state.messages:
         messages.append({"role": m["role"], "content": m["content"]})
     
@@ -160,7 +167,7 @@ def run_agent(user_input):
     return msg.content
 
 # --- 5. UI ---
-st.set_page_config(page_title="PAA Intelligent Agent", page_icon="✈️")
+st.set_page_config(page_title="PAA Agent", page_icon="✈️")
 st.title("✈️ PAA Intelligent Agent")
 
 w_client = get_weaviate_client()
@@ -169,15 +176,14 @@ ingest_data(w_client)
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Flight status of SV726?"):
+if prompt := st.chat_input("Ask about SV726 or baggage policy..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     
-    with st.spinner("Accessing AODB Records..."):
+    with st.spinner("Checking..."):
         ans = run_agent(prompt)
         st.session_state.messages.append({"role": "assistant", "content": ans})
         with st.chat_message("assistant"): st.markdown(ans)
