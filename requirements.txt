@@ -1,9 +1,6 @@
 streamlit
-google-generativeai
+openai
 weaviate-client
 sentence-transformers
 pypdf
-beautifulsoup4
-requests
-lxml
 langchain-text-splitters
