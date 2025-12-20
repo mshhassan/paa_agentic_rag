@@ -4,11 +4,6 @@ weaviate-client
 sentence-transformers
 pypdf
 langchain-text-splitters
-beautifulsoup4
+lxml
 requests
-streamlit
-openai
-weaviate-client
-sentence-transformers
-pypdf
-langchain-text-splitters
+beautifulsoup4
