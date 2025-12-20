@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from openai import OpenAI
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.config import Property, DataType, Configure
@@ -8,22 +8,21 @@ from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter 
 from pypdf import PdfReader
 import os
+import json
 import warnings
 
-# Suppress warnings
 warnings.filterwarnings("ignore")
 
 # --- 1. CONFIGURATION ---
 try:
-    # Get Keys from Streamlit Secrets
     WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud" 
     WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"] 
-    GEMINI_KEY = st.secrets["GEMINI_API_KEY"] 
+    # Lazmi: Streamlit secrets mein 'OPENAI_API_KEY' add karein
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"] 
     
-    # Simple configuration
-    genai.configure(api_key=GEMINI_KEY)
-except Exception as e:
-    st.error(f"Configuration Error: {e}")
+    client_openai = OpenAI(api_key=OPENAI_API_KEY)
+except KeyError as e:
+    st.error(f"Secret Missing: {e}. Please add OPENAI_API_KEY to Streamlit Secrets.")
     st.stop()
 
 @st.cache_resource
@@ -33,96 +32,126 @@ def load_embedding_model():
 EMBEDDING_MODEL = load_embedding_model()
 
 # --- 2. WEAVIATE SETUP ---
-@st.cache_resource(show_spinner="Connecting to Database...")
-def get_client():
-    try:
-        client = weaviate.connect_to_weaviate_cloud(
-            cluster_url=WEAVIATE_URL, 
-            auth_credentials=Auth.api_key(WEAVIATE_KEY)
+@st.cache_resource(show_spinner="Connecting to Weaviate...")
+def get_weaviate_client():
+    client = weaviate.connect_to_weaviate_cloud(
+        cluster_url=WEAVIATE_URL, 
+        auth_credentials=Auth.api_key(WEAVIATE_KEY)
+    )
+    if not client.collections.exists("PAAPolicy"):
+        client.collections.create(
+            name="PAAPolicy",
+            vectorizer_config=Configure.Vectorizer.none(),
+            properties=[Property(name="content", data_type=DataType.TEXT)]
         )
-        # Collection create karein agar nahi hai
-        if not client.collections.exists("PAAPolicy"):
-            client.collections.create(
-                name="PAAPolicy",
-                vectorizer_config=Configure.Vectorizer.none(),
-                properties=[Property(name="content", data_type=DataType.TEXT)]
-            )
-        return client
-    except Exception as e:
-        st.error(f"Weaviate Connection Failed: {e}")
-        return None
+    return client
 
-@st.cache_resource(show_spinner="Reading PDF Policy...")
+@st.cache_resource(show_spinner="Reading PDF...")
 def ingest_data(_client):
-    if _client and os.path.exists("policy_baggage.pdf"):
-        try:
-            reader = PdfReader("policy_baggage.pdf")
-            text = "".join([p.extract_text() for p in reader.pages])
-            splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-            chunks = splitter.split_text(text)
-            
-            collection = _client.collections.get("PAAPolicy")
-            count = collection.aggregate.over_all(total_count=True).total_count
-            
-            if count == 0:
-                objs = [DataObject(properties={"content": c}, vector=EMBEDDING_MODEL.encode(c).tolist()) for c in chunks]
-                collection.data.insert_many(objs)
-        except Exception as e:
-            st.warning(f"Ingestion Warning: {e}")
+    if os.path.exists("policy_baggage.pdf"):
+        reader = PdfReader("policy_baggage.pdf")
+        text = "".join([p.extract_text() for p in reader.pages])
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_text(text)
+        
+        collection = _client.collections.get("PAAPolicy")
+        count = collection.aggregate.over_all(total_count=True).total_count
+        if count == 0:
+            objs = [DataObject(properties={"content": c}, vector=EMBEDDING_MODEL.encode(c).tolist()) for c in chunks]
+            collection.data.insert_many(objs)
     return True
 
 # --- 3. RETRIEVAL TOOL ---
-def get_baggage_policy(query: str):
-    """Answers questions specifically about baggage rules and airline policy."""
-    client = get_client()
-    if not client: return "Database connection error."
-    
-    col = client.collections.get("PAAPolicy")
+def search_baggage_policy(query: str):
+    """Searches the PAA baggage policy PDF for specific rules and weight limits."""
+    w_client = get_weaviate_client()
+    col = w_client.collections.get("PAAPolicy")
     res = col.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=2)
-    
     if res.objects:
-        return "\n".join([obj.properties['content'] for obj in res.objects])
-    return "No specific baggage policy found in the records."
+        return "\n".join([o.properties['content'] for o in res.objects])
+    return "No relevant baggage policy found in the documents."
 
-# --- 4. AGENT LOGIC (STABLE ENDPOINT) ---
-def agent_response(user_input: str):
-    # 'gemini-1.5-flash' is the correct ID. 
-    # If it fails, try 'gemini-1.5-flash-latest'
+# --- 4. OPENAI AGENT LOGIC ---
+
+
+def run_openai_agent(user_input):
+    # Tool definition for OpenAI format
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "search_baggage_policy",
+            "description": "Get detailed baggage and luggage rules from the PAA PDF policy.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "The search term"}},
+                "required": ["query"]
+            }
+        }
+    }]
+
+    messages = [
+        {"role": "system", "content": "You are a professional PAA Supervisor. Use the provided search tool to get facts from the PDF before answering. Be polite and helpful."},
+        {"role": "user", "content": user_input}
+    ]
+
     try:
-        model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
-            tools=[get_baggage_policy],
-            system_instruction="You are a PAA (Pakistan Aviation Authority) Expert. Always check the baggage policy tool before answering questions about luggage or rules."
+        # Step 1: Pehli call OpenAI ko tool decide karne ke liye
+        response = client_openai.chat.completions.create(
+            model="gpt-4o-mini", # Sasta aur behtreen
+            messages=messages,
+            tools=tools,
+            tool_choice="auto"
         )
+
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+
+        # Step 2: Agar OpenAI ko data chahiye tool se
+        if tool_calls:
+            messages.append(response_message)
+            
+            for tool_call in tool_calls:
+                function_args = json.loads(tool_call.function.arguments)
+                # Tool ko execute karein
+                function_response = search_baggage_policy(function_args.get("query"))
+                
+                messages.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": "search_baggage_policy",
+                    "content": function_response,
+                })
+            
+            # Step 3: Final response with data
+            second_response = client_openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+            )
+            return second_response.choices[0].message.content
         
-        # Start chat with automatic function calling enabled
-        chat = model.start_chat(enable_automatic_function_calling=True)
-        response = chat.send_message(user_input)
-        return response.text
+        return response_message.content
+
     except Exception as e:
-        return f"Model Error: {str(e)}"
+        return f"OpenAI Error: {str(e)}"
 
-# --- 5. UI INTERFACE ---
-st.set_page_config(page_title="PAA Agent", page_icon="🇵🇰")
-st.title("🇵🇰 PAA Agentic AI")
+# --- 5. STREAMLIT UI ---
+st.set_page_config(page_title="PAA OpenAI Agent", page_icon="✈️")
+st.title("✈️ PAA Agentic AI (Powered by OpenAI)")
 
-client = get_client()
-ingest_data(client)
+w_client = get_weaviate_client()
+ingest_data(w_client)
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "How can I help you with PAA services today?"}]
+    st.session_state.messages = [{"role": "assistant", "content": "Asalam-o-Alaikum! How can I help you with PAA services today?"}]
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]): 
-        st.write(msg["content"])
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Pia baggage policy?"):
+if prompt := st.chat_input("Ask about baggage weight or rules..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"): 
-        st.write(prompt)
+    with st.chat_message("user"): st.markdown(prompt)
     
-    with st.spinner("Processing with Agent..."):
-        answer = agent_response(prompt)
-        with st.chat_message("assistant"): 
-            st.write(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+    with st.spinner("AI is retrieving policy details..."):
+        ans = run_openai_agent(prompt)
+        with st.chat_message("assistant"): st.markdown(ans)
+        st.session_state.messages.append({"role": "assistant", "content": ans})
