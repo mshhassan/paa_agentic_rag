@@ -4,4 +4,5 @@ weaviate-client
 sentence-transformers
 pypdf
 langchain-text-splitters
-lxml
+beautifulsoup4
+requests
