@@ -2,6 +2,7 @@ streamlit
 openai
 weaviate-client
 sentence-transformers
+torch
 pypdf
 langchain-text-splitters
 lxml
