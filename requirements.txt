@@ -2,9 +2,8 @@ streamlit
 openai
 weaviate-client
 sentence-transformers
-torch
+torch --index-url https://download.pytorch.org/whl/cpu
 pypdf
-langchain-text-splitters
 lxml
 requests
 beautifulsoup4
