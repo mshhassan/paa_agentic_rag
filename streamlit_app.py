@@ -68,62 +68,63 @@ def run_paa_engine(query):
     st.session_state.agent_status = {"XML": False, "Web": False, "Docs": False}
     st.session_state.trace.append(f"> 📥 Query Received: {query}")
     
-    # Improved Prompt for better JSON reliability
-    analysis_prompt = f"""
-    Analyze query: "{query}"
-    
-    RULES:
-    1. If the query contains a flight number (like SV122, PK300) or asks for flight schedule/status, 
-       GIVE XML a score of 1.0 and Web a score of 0.0.
-    2. If the query asks for official links or "where to find" something online, GIVE Web a score of 1.0.
-    3. If the query is about baggage, rules, or policies, GIVE Docs a score of 1.0.
-    
-    Return JSON: {{"XML": score, "Web": score, "Docs": score}}
-    """
-    
+    # Routing Logic
+    analysis_prompt = f"Analyze: '{query}'. Scores (0-1): XML, Web, Docs. Return JSON format."
     try:
         resp = client_openai.chat.completions.create(
-            model="gpt-4o-mini", 
-            response_format={"type":"json_object"}, 
-            messages=[{"role":"system", "content":"You are a PAA Supervisor. Always return numeric scores in JSON."}, 
-                      {"role":"user","content":analysis_prompt}]
+            model="gpt-4o-mini", response_format={"type":"json_object"}, 
+            messages=[{"role":"system", "content":"You are a PAA Supervisor."}, {"role":"user","content":analysis_prompt}]
         )
         scores = json.loads(resp.choices[0].message.content)
         st.session_state.trace.append(f"> 🤖 Routing Scores: {scores}")
 
-        context = ""
+        context_data = ""
         mapping = {"XML": "PAAWeb", "Web": "PAAWebLink", "Docs": "PAAPolicy"}
         
-        # Safety Check for keys in scores
         for key in ["XML", "Web", "Docs"]:
-            # Check if key exists and is a valid number
-            score = scores.get(key, 0.0) 
-            if isinstance(score, (int, float)) and score >= THRESHOLD:
+            score = scores.get(key, 0.0)
+            if score >= THRESHOLD:
                 st.session_state.agent_status[key] = True
-                st.session_state.trace.append(f"> 🔮 {key} Agent Activated (Score {score})")
+                st.session_state.trace.append(f"> 🔮 {key} Agent Activated")
                 retrieved = fetch_from_weaviate(query, mapping[key])
-                if retrieved: 
-                    context += f"\n--- {key} DATA ---\n{retrieved}\n"
-            else:
-                st.session_state.trace.append(f"> ⚪ {key} Agent Bypassed")
+                if retrieved and len(retrieved.strip()) > 0:
+                    context_data += f"\n[{key} Official Data]: {retrieved}"
+                else:
+                    st.session_state.trace.append(f"> ⚠️ {key} Agent returned NO data from DB.")
 
-        sys_inst = f"""You are the PAA Official Assistant. 
-        Use the provided context to answer. If context is missing, use general knowledge.
-        Context: {context}"""
-        
+        # --- SMART LLM RESPONSE LOGIC ---
+        if context_data.strip():
+            # Agar data mil gaya toh official response
+            system_message = f"""
+            You are the PAA Official Assistant. 
+            Answer using the Official Context provided below.
+            
+            OFFICIAL CONTEXT:
+            {context_data}
+            """
+        else:
+            # Agar DB khali hai toh LLM knowledge with Disclaimer
+            st.session_state.trace.append("> ℹ️ No DB records found. Switching to LLM Knowledge.")
+            system_message = f"""
+            You are the PAA Official Assistant. 
+            CRITICAL INSTRUCTION: No data was found in the PAA AODB/Database for this query.
+            1. You MUST start your response with this EXACT disclaimer: 
+               "⚠️ *Disclaimer: Yeh maloomat general internet records se li gayi hain, PAA ke official AODB database mein filhal iska record maujood nahi hai.*"
+            2. After the disclaimer, provide the best possible answer using your general knowledge.
+            """
+
         ans_resp = client_openai.chat.completions.create(
             model="gpt-4o", 
-            messages=[{"role": "system", "content": sys_inst}] + st.session_state.messages[-3:] + [{"role": "user", "content": query}]
+            messages=[{"role": "system", "content": system_message}] + st.session_state.messages[-3:] + [{"role": "user", "content": query}]
         )
         answer = ans_resp.choices[0].message.content
         
         st.session_state.trace.append("> ✅ Process Complete.")
         st.session_state.messages.append({"role": "user", "content": query})
         st.session_state.messages.append({"role": "assistant", "content": answer})
-        
+
     except Exception as e:
-        st.error(f"Error in Engine: {e}")
-        st.session_state.trace.append(f"> ❌ Error: {str(e)}")
+        st.error(f"Engine Error: {e}")
 
 # --- 4. THREE-COLUMN LAYOUT ---
 col1, col2, col3 = st.columns([1.2, 1.5, 2], gap="medium")
