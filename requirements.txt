@@ -8,3 +8,12 @@ lxml
 requests
 beautifulsoup4
 pandas
+streamlit
+openai
+weaviate-client
+sentence-transformers
+torch
+pypdf
+lxml
+requests
+beautifulsoup4
