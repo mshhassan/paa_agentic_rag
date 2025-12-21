@@ -6,92 +6,79 @@ from sentence_transformers import SentenceTransformer
 import re
 import os
 
+# --- CONFIG ---
 WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud"
 WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
 MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 
-st.title("🔧 PAA Database Repair (Deep Parse)")
+st.title("🛡️ PAA Knowledge Base Ingestor")
+st.markdown("Yeh script Flights, Web Links, aur Policy data load karegi.")
 
-if st.button("🚀 Force Re-Ingest Flight Data"):
-    if not os.path.exists("flight_records.xml"):
-        st.error("❌ flight_records.xml file nahi mili!")
-        st.stop()
-
+if st.button("🚀 Build Full Database"):
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=WEAVIATE_URL, 
         auth_credentials=Auth.api_key(WEAVIATE_KEY)
     )
     
     try:
-        with open("flight_records.xml", "r", encoding='utf-8') as f:
-            xml_data = f.read()
-
-        # Step 1: Find all flight blocks using a more flexible regex
-        # Yeh har us cheez ko pakray ga jo FlightData ya AFDSFlightData ke darmian hai
-        records = re.findall(r'<(?:[a-zA-Z0-9]+:)?AFDSFlightData>(.*?)</(?:[a-zA-Z0-9]+:)?AFDSFlightData>', xml_data, re.DOTALL)
-        
-        if not records:
-            # Agar AFDSFlightData nahi mila, toh generic FlightData check karte hain
-            records = re.findall(r'<(?:[a-zA-Z0-9]+:)?FlightData>(.*?)</(?:[a-zA-Z0-9]+:)?FlightData>', xml_data, re.DOTALL)
-
-        if not records:
-            st.error("❌ XML Blocks nahi milay. File ka content empty hai ya tags mukhtalif hain.")
-            st.stop()
-
-        # Step 2: Collection Refresh
-        if client.collections.exists("PAAFlightStatus"):
-            client.collections.delete("PAAFlightStatus")
-        
-        coll = client.collections.create(
-            name="PAAFlightStatus",
-            properties=[
-                Property(name="content", data_type=DataType.TEXT),
-                Property(name="flight_num", data_type=DataType.TEXT),
-            ],
-            vectorizer_config=Configure.Vectorizer.none()
-        )
-        
-        # Step 3: Deep Tag Extraction
-        success_count = 0
-        for rec in records:
-            def extract(tag):
-                # Yeh regex namespaces (like ns0:Tag) ko ignore kar ke data nikalta hai
-                m = re.search(rf'<(?:[a-zA-Z0-9]+:)?{tag}[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?{tag}>', rec, re.DOTALL)
-                return m.group(1).strip() if m else "N/A"
-
-            f_id = extract("FlightIdentity")
-            # Kuch files mein FlightIdentity ki jagah FlightNumber hota hai
-            if f_id == "N/A": f_id = extract("FlightNumber")
-            
-            f_date = extract("ScheduledDate")
-            f_time = extract("ScheduledDateTime")
-            f_status = extract("FlightStatusCode")
-            f_gate = extract("GateIdentity")
-            f_belt = extract("BaggageReclaimIdentity")
-            f_counter = extract("CheckInDesks")
-            
-            # Create a Very Detailed Summary for RAG
-            full_summary = (
-                f"Flight Information for {f_id}:\n"
-                f"- Scheduled Date/Time: {f_date} {f_time}\n"
-                f"- Operational Status: {f_status}\n"
-                f"- Assigned Gate: {f_gate}\n"
-                f"- Baggage Reclaim Belt: {f_belt}\n"
-                f"- Check-in Counters: {f_counter}\n"
-                f"Note: This is a live AODB record."
+        # 1. Sab collections ko refresh karein
+        collections_to_init = ["PAAFlightStatus", "PAAWebLink", "PAAPolicy"]
+        for name in collections_to_init:
+            if client.collections.exists(name):
+                client.collections.delete(name)
+            client.collections.create(
+                name=name,
+                properties=[
+                    Property(name="content", data_type=DataType.TEXT),
+                    Property(name="category", data_type=DataType.TEXT), # Optional filtering ke liye
+                ],
+                vectorizer_config=Configure.Vectorizer.none()
             )
+
+        # 2. FLIGHT INGESTION (From XML)
+        if os.path.exists("flight_records.xml"):
+            with open("flight_records.xml", "r", encoding='utf-8') as f:
+                xml_data = f.read()
             
-            vector = MODEL.encode(full_summary).tolist()
-            coll.data.insert(
-                properties={"content": full_summary, "flight_num": f_id},
-                vector=vector
-            )
-            success_count += 1
-            st.write(f"✅ Loaded: **{f_id}** (Status: {f_status})")
+            records = re.findall(r'<(?:[a-zA-Z0-9]+:)?AFDSFlightData>(.*?)</(?:[a-zA-Z0-9]+:)?AFDSFlightData>', xml_data, re.DOTALL)
+            coll_flight = client.collections.get("PAAFlightStatus")
             
-        st.success(f"Success! {success_count} records ingested into Weaviate.")
-    
+            for rec in records:
+                def extract(tag):
+                    m = re.search(rf'<(?:[a-zA-Z0-9]+:)?{tag}[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?{tag}>', rec, re.DOTALL)
+                    return m.group(1).strip() if m else "N/A"
+
+                f_id = extract("FlightIdentity") or extract("FlightNumber")
+                summary = f"Flight {f_id}: Date {extract('ScheduledDate')}, Status {extract('FlightStatusCode')}, Gate {extract('GateIdentity')}, Belt {extract('BaggageReclaimIdentity')}, Counters {extract('CheckInDesks')}."
+                
+                coll_flight.data.insert(
+                    properties={"content": summary, "category": "flight"},
+                    vector=MODEL.encode(summary).tolist()
+                )
+            st.success(f"✅ {len(records)} Flights Ingested.")
+
+        # 3. WEB LINKS INGESTION (Operational Links)
+        coll_web = client.collections.get("PAAWebLink")
+        links = [
+            {"t": "Lost and Found Baggage", "u": "https://www.paa.gov.pk/lost-found"},
+            {"t": "Aeronautical Information (NOTAMs)", "u": "https://www.paa.gov.pk/notams"},
+            {"t": "Passenger Complaint Cell", "u": "https://www.paa.gov.pk/complaints"},
+            {"t": "Flight Inquiry PAA", "u": "https://www.paa.gov.pk/flight-inquiry"}
+        ]
+        for l in links:
+            txt = f"{l['t']} Link: {l['u']}"
+            coll_web.data.insert(properties={"content": txt, "category": "web"}, vector=MODEL.encode(txt).tolist())
+        st.success("✅ Operational Web Links Ingested.")
+
+        # 4. POLICY PLACEHOLDER (Wait for PDF)
+        coll_policy = client.collections.get("PAAPolicy")
+        policy_txt = "Standard PAA Baggage Policy: Economy 20kg, Business 30kg. Claims for lost items must be made within 24 hours."
+        coll_policy.data.insert(properties={"content": policy_txt, "category": "policy"}, vector=MODEL.encode(policy_txt).tolist())
+        
+        st.balloons()
+        st.success("🎉 PAA Knowledge Base is now Ready!")
+
     except Exception as e:
-        st.error(f"Unexpected Error: {str(e)}")
+        st.error(f"Error: {e}")
     finally:
         client.close()
