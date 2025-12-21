@@ -2,7 +2,6 @@ import streamlit as st
 from openai import OpenAI
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.query import Filter
 import json
 import re
 import warnings
@@ -38,31 +37,31 @@ def log_agent_activity(agent_name, message):
         st.session_state.agent_logs = []
     log_entry = f"[{agent_name.upper()}]: {message}"
     st.session_state.agent_logs.append(log_entry)
-    # Update sidebar console live
     with st.sidebar:
         st.code("\n".join(st.session_state.agent_logs[-15:]), language="bash")
 
-# --- 3. UPDATED SUB-AGENTS ---
+# --- 3. SUB-AGENTS ---
 
 def flight_inquiry_agent(query):
-    log_agent_activity("Flight-Agent", f"Searching AODB for query: {query}")
+    log_agent_activity("Flight-Agent", f"Searching AODB for Detailed Info: {query}")
     coll = W_CLIENT.collections.get("PAAFlightStatus")
     
-    # Hybrid Search (Weighting Keyword more for J2143 accuracy)
+    # Hybrid search with 0.4 alpha to prioritize keywords like flight numbers
     response = coll.query.hybrid(
         query=query,
         vector=EMBEDDING_MODEL.encode(query).tolist(),
         limit=3,
-        alpha=0.3
+        alpha=0.4
     )
     
     if not response.objects:
         log_agent_activity("Flight-Agent", "Result: Empty")
         return "No specific flight record found."
     
+    # Context summary containing all resource allocations
     results = [o.properties.get('content', '') for o in response.objects]
-    log_agent_activity("Flight-Agent", f"Found {len(results)} records.")
-    return "\n".join(results)
+    log_agent_activity("Flight-Agent", f"Retrieved context for {len(results)} records.")
+    return "\n---\n".join(results)
 
 def policy_documentation_agent(query):
     log_agent_activity("Policy-Agent", f"Reading PDF docs for: {query}")
@@ -80,12 +79,12 @@ def web_query_agent(query):
 # --- 4. MASTER SUPERVISOR ---
 
 def supervisor_agent(user_input):
-    log_agent_activity("Supervisor", "Analyzing query and delegating tools...")
+    log_agent_activity("Supervisor", "Routing query and expecting high-detail results...")
     
     tools = [
         {"type": "function", "function": {
             "name": "flight_inquiry_agent", 
-            "description": "Get flight timings and status.",
+            "description": "Get detailed flight info including Gate, Counters, Belts, and Status.",
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }},
         {"type": "function", "function": {
@@ -100,8 +99,19 @@ def supervisor_agent(user_input):
         }}
     ]
 
+    system_msg = """You are the PAA Master Supervisor.
+    Your task is to provide COMPREHENSIVE flight information. 
+    If the context provided by 'flight_inquiry_agent' contains:
+    - Gate Identity
+    - Check-in Counters
+    - Baggage Reclaim/Belt
+    - Stand or Status
+    You MUST include these details in your final answer. If a resource is 'TBD' or 'N/A', state that it is not yet assigned.
+    Format your output using bullet points for clarity.
+    Today's Date: Dec 21, 2025."""
+
     messages = [
-        {"role": "system", "content": "You are the PAA Master Supervisor. Be concise. Today: Dec 21, 2025."},
+        {"role": "system", "content": system_msg},
         {"role": "user", "content": user_input}
     ]
 
@@ -121,7 +131,7 @@ def supervisor_agent(user_input):
             result = agent_map[tc.function.name](arg_query)
             messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": result})
         
-        log_agent_activity("Supervisor", "Synthesizing final answer from agents...")
+        log_agent_activity("Supervisor", "Synthesizing detailed final answer...")
         final_res = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
         return final_res.choices[0].message.content
     
@@ -130,13 +140,13 @@ def supervisor_agent(user_input):
 # --- 5. STREAMLIT UI ---
 st.set_page_config(page_title="PAA Master Agent", layout="wide")
 
-# Sidebar Console
 with st.sidebar:
     st.header("🕵️ Agent Logic Trace")
+    st.info("AEDB Resource tracking enabled.")
     st.markdown("---")
-    if st.button("Clear Logs"):
+    if st.button("Clear Console"):
         st.session_state.agent_logs = []
-    st.write("Live Execution Path:")
+    st.write("Live Data Flow:")
 
 st.title("🏢 PAA Intelligent Master Agent")
 
@@ -146,7 +156,7 @@ if "messages" not in st.session_state:
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Ex: Status of J2143?"):
+if prompt := st.chat_input("Ex: What is the gate and counter for flight CZ8069?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     with st.chat_message("assistant"):
