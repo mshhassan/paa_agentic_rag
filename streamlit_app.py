@@ -8,7 +8,7 @@ import json
 # --- 1. CONFIG & INITIALIZATION ---
 st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
 
-# Initialize Session States (VVIP for avoiding Blank Page)
+# Initialize Session States
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "trace" not in st.session_state:
@@ -22,7 +22,10 @@ def load_resources():
     return model
 
 EMBED = load_resources()
-THRESHOLD = 0.7 
+
+# --- CHANGES START HERE ---
+THRESHOLD = 0.5  # Reduced from 0.7 for better agent triggering
+# --- CHANGES END HERE ---
 
 # --- 2. WEAVIATE RETRIEVER ---
 def fetch_from_weaviate(query, collection_name):
@@ -41,7 +44,7 @@ def fetch_from_weaviate(query, collection_name):
         client.close()
         
         if not res.objects:
-            return "No specific record found."
+            return "" # Return empty if no match
             
         return "\n".join([o.properties['content'] for o in res.objects])
     except Exception as e:
@@ -49,12 +52,13 @@ def fetch_from_weaviate(query, collection_name):
 
 # --- 3. AGENTIC ENGINE ---
 def run_paa_engine(query):
-    st.session_state.trace = [] # Reset trace for new query
+    st.session_state.trace = [] 
     st.session_state.trace.append(f"🔍 **Analyzing Query:** {query}")
     
     # Routing Decision
     analysis_prompt = f"""
     Analyze query: "{query}"
+    If the query looks like a flight number (e.g., SV726, PK300), prioritize XML.
     Scores (0-1): XML (Flight info), Web (Links), Docs (Baggage/Policy).
     Return JSON: {{"XML": score, "Web": score, "Docs": score}}
     """
@@ -73,16 +77,25 @@ def run_paa_engine(query):
         if score >= THRESHOLD:
             st.session_state.trace.append(f"📡 **{key} Agent:** Active (Score {score})")
             retrieved_text = fetch_from_weaviate(query, mapping[key])
-            context += f"\n--- {key} DATA ---\n{retrieved_text}\n"
+            if retrieved_text:
+                context += f"\n--- {key} DATA ---\n{retrieved_text}\n"
         else:
             st.session_state.trace.append(f"⚪ **{key} Agent:** Bypassed")
 
-    # Final Answer
+    # --- OPTION A: HYBRID PROMPT IMPLEMENTATION ---
     system_instruction = f"""
     You are the PAA (Pakistan Airports Authority) Official Assistant.
-    STRICT RULE: Only use the provided context to answer. 
-    If data is missing, say 'Information not found in current records'.
-    CONTEXT: {context}
+
+    INSTRUCTIONS:
+    1. Primary Source: Use the CONTEXT DATA provided below to answer.
+    2. Fallback: If the CONTEXT DATA is empty, missing, or doesn't have details about "{query}", 
+       use your internal general knowledge to help the user.
+    3. Disclosure: If you use your own knowledge (and not the context), start with: 
+       "Based on general aviation information..." 
+    4. Accuracy: If you absolutely don't know something, only then say you don't have the data.
+
+    CONTEXT DATA:
+    {context if context else "No official records found for this query."}
     """
     
     ans_resp = client_openai.chat.completions.create(
@@ -97,25 +110,23 @@ def run_paa_engine(query):
 # --- 4. UI LAYOUT ---
 st.title("✈️ PAA AI: Enterprise Intelligence")
 
-# Sidebar for Trace
 with st.sidebar:
     st.header("🔍 Agentic Trace")
     for t in st.session_state.trace:
         st.write(t)
     if st.button("Clear Chat"):
         st.session_state.messages = []
+        st.session_state.trace = []
         st.rerun()
 
-# Chat Display
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Chat Input
-if prompt := st.chat_input("How can I help you today?"):
+if prompt := st.chat_input("Ask about flights, baggage or policies..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    with st.spinner("Consulting PAA Agents..."):
+    with st.spinner("Collaborating with PAA Agents..."):
         run_paa_engine(prompt)
     st.rerun()
