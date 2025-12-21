@@ -11,74 +11,90 @@ WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud"
 WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
 MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 
-st.title("🛡️ PAA Knowledge Base Ingestor")
-st.markdown("Yeh script Flights, Web Links, aur Policy data load karegi.")
+st.set_page_config(page_title="PAA Admin Ingestor", layout="centered")
+st.title("🛡️ PAA RAG - Clean & Rebuild")
+st.warning("Yeh process purana saara database delete kar ke naya data load karega.")
 
-if st.button("🚀 Build Full Database"):
+if st.button("🚀 Wipe Old Data & Sync New AODB"):
+    if not os.path.exists("flight_records.xml"):
+        st.error("❌ flight_records.xml nahi mili! Pehle file upload karein.")
+        st.stop()
+
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=WEAVIATE_URL, 
         auth_credentials=Auth.api_key(WEAVIATE_KEY)
     )
     
     try:
-        # 1. Sab collections ko refresh karein
-        collections_to_init = ["PAAFlightStatus", "PAAWebLink", "PAAPolicy"]
-        for name in collections_to_init:
+        # 1. WIPE OLD COLLECTIONS
+        st.info("🗑️ Purana data saaf kiya ja raha hai...")
+        target_colls = ["PAAFlightStatus", "PAAWebLink", "PAAPolicy"]
+        for name in target_colls:
             if client.collections.exists(name):
                 client.collections.delete(name)
             client.collections.create(
                 name=name,
-                properties=[
-                    Property(name="content", data_type=DataType.TEXT),
-                    Property(name="category", data_type=DataType.TEXT), # Optional filtering ke liye
-                ],
+                properties=[Property(name="content", data_type=DataType.TEXT)],
                 vectorizer_config=Configure.Vectorizer.none()
             )
 
-        # 2. FLIGHT INGESTION (From XML)
-        if os.path.exists("flight_records.xml"):
-            with open("flight_records.xml", "r", encoding='utf-8') as f:
-                xml_data = f.read()
-            
-            records = re.findall(r'<(?:[a-zA-Z0-9]+:)?AFDSFlightData>(.*?)</(?:[a-zA-Z0-9]+:)?AFDSFlightData>', xml_data, re.DOTALL)
-            coll_flight = client.collections.get("PAAFlightStatus")
-            
-            for rec in records:
-                def extract(tag):
-                    m = re.search(rf'<(?:[a-zA-Z0-9]+:)?{tag}[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?{tag}>', rec, re.DOTALL)
-                    return m.group(1).strip() if m else "N/A"
+        # 2. READ & PARSE XML
+        with open("flight_records.xml", "r", encoding='utf-8') as f:
+            xml_content = f.read()
 
-                f_id = extract("FlightIdentity") or extract("FlightNumber")
-                summary = f"Flight {f_id}: Date {extract('ScheduledDate')}, Status {extract('FlightStatusCode')}, Gate {extract('GateIdentity')}, Belt {extract('BaggageReclaimIdentity')}, Counters {extract('CheckInDesks')}."
-                
-                coll_flight.data.insert(
-                    properties={"content": summary, "category": "flight"},
-                    vector=MODEL.encode(summary).tolist()
-                )
-            st.success(f"✅ {len(records)} Flights Ingested.")
+        # Flexible extraction for AFDSFlightData or FlightData
+        blocks = re.findall(r'<(?:[a-zA-Z0-9]+:)?(?:AFDS)?FlightData>(.*?)</(?:[a-zA-Z0-9]+:)?(?:AFDS)?FlightData>', xml_content, re.DOTALL)
+        
+        if not blocks:
+            st.error("❌ XML Blocks nahi milay! Tags check karein.")
+            st.stop()
 
-        # 3. WEB LINKS INGESTION (Operational Links)
+        coll_flight = client.collections.get("PAAFlightStatus")
+        success_count = 0
+
+        for block in blocks:
+            def get_val(tag):
+                m = re.search(rf'<(?:[a-zA-Z0-9]+:)?{tag}[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?{tag}>', block, re.DOTALL)
+                return m.group(1).strip() if m and m.group(1) else "TBD"
+
+            f_id = get_val("FlightIdentity") or get_val("FlightNumber")
+            # Creating a rich, operational summary
+            summary = (
+                f"Flight: {f_id} | Date: {get_val('ScheduledDate')} | Time: {get_val('ScheduledTime')}\n"
+                f"Status: {get_val('FlightStatusCode')} | Gate: {get_val('GateIdentity')} | "
+                f"Belt: {get_val('BaggageReclaimIdentity')} | Counters: {get_val('CheckInDesks')}\n"
+                f"Direction: {'Arrival' if 'BaggageReclaimIdentity' in block else 'Departure'}"
+            )
+            
+            vector = MODEL.encode(summary).tolist()
+            coll_flight.data.insert(properties={"content": summary}, vector=vector)
+            success_count += 1
+
+        # 3. LOAD DEFAULT WEB LINKS (So system doesn't crash)
         coll_web = client.collections.get("PAAWebLink")
         links = [
-            {"t": "Lost and Found Baggage", "u": "https://www.paa.gov.pk/lost-found"},
-            {"t": "Aeronautical Information (NOTAMs)", "u": "https://www.paa.gov.pk/notams"},
-            {"t": "Passenger Complaint Cell", "u": "https://www.paa.gov.pk/complaints"},
-            {"t": "Flight Inquiry PAA", "u": "https://www.paa.gov.pk/flight-inquiry"}
+            "Lost & Found Baggage: https://www.paa.gov.pk/lost-found",
+            "Passenger Complaints: https://www.paa.gov.pk/complaints",
+            "Flight Inquiry Live: https://www.paa.gov.pk/flight-inquiry"
         ]
         for l in links:
-            txt = f"{l['t']} Link: {l['u']}"
-            coll_web.data.insert(properties={"content": txt, "category": "web"}, vector=MODEL.encode(txt).tolist())
-        st.success("✅ Operational Web Links Ingested.")
+            coll_web.data.insert(properties={"content": l}, vector=MODEL.encode(l).tolist())
 
-        # 4. POLICY PLACEHOLDER (Wait for PDF)
-        coll_policy = client.collections.get("PAAPolicy")
-        policy_txt = "Standard PAA Baggage Policy: Economy 20kg, Business 30kg. Claims for lost items must be made within 24 hours."
-        coll_policy.data.insert(properties={"content": policy_txt, "category": "policy"}, vector=MODEL.encode(policy_txt).tolist())
-        
+        st.success(f"✅ Clean Sync Successful! {success_count} flights and operational links loaded.")
         st.balloons()
-        st.success("🎉 PAA Knowledge Base is now Ready!")
 
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Unexpected Error: {e}")
+    finally:
+        client.close()
+
+# --- VALIDATOR ---
+st.markdown("---")
+if st.button("📊 Verify Database Count"):
+    client = weaviate.connect_to_weaviate_cloud(cluster_url=WEAVIATE_URL, auth_credentials=Auth.api_key(WEAVIATE_KEY))
+    try:
+        coll = client.collections.get("PAAFlightStatus")
+        count = len(coll.query.fetch_objects(limit=1).objects) # Quick check
+        st.write(f"Flights in Database: **{success_count if 'success_count' in locals() else 'Check Log'}**")
     finally:
         client.close()
