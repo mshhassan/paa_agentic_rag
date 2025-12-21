@@ -8,24 +8,46 @@ import json
 # --- 1. CONFIG & INITIALIZATION ---
 st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
 
-# Initialize Session States
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "trace" not in st.session_state:
-    st.session_state.trace = []
+# Custom CSS for UI Matching (Black Trace Console & Dots)
+st.markdown("""
+    <style>
+    .trace-box {
+        background-color: #0e1117;
+        color: #00ff00;
+        padding: 15px;
+        border-radius: 10px;
+        font-family: 'Courier New', Courier, monospace;
+        font-size: 0.85rem;
+        height: 600px;
+        overflow-y: auto;
+        border: 1px solid #333;
+    }
+    .agent-dot {
+        height: 20px;
+        width: 20px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-bottom: 5px;
+    }
+    .dot-active { background-color: #00e5ff; box-shadow: 0 0 10px #00e5ff; }
+    .dot-inactive { background-color: #333; }
+    .dot-supervisor { background-color: #ffcc00; }
+    </style>
+""", unsafe_allow_html=True)
+
+if "messages" not in st.session_state: st.session_state.messages = []
+if "trace" not in st.session_state: st.session_state.trace = []
+if "agent_status" not in st.session_state: 
+    st.session_state.agent_status = {"XML": False, "Web": False, "Docs": False}
 
 client_openai = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 @st.cache_resource
 def load_resources():
-    model = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
-    return model
+    return SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
 
 EMBED = load_resources()
-
-# --- CHANGES START HERE ---
-THRESHOLD = 0.5  # Reduced from 0.7 for better agent triggering
-# --- CHANGES END HERE ---
+THRESHOLD = 0.5 
 
 # --- 2. WEAVIATE RETRIEVER ---
 def fetch_from_weaviate(query, collection_name):
@@ -35,98 +57,82 @@ def fetch_from_weaviate(query, collection_name):
             auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
         )
         coll = client.collections.get(collection_name)
-        
-        res = coll.query.near_vector(
-            near_vector=EMBED.encode(query).tolist(), 
-            limit=5,
-            return_properties=["content"]
-        )
+        res = coll.query.near_vector(near_vector=EMBED.encode(query).tolist(), limit=3, return_properties=["content"])
         client.close()
-        
-        if not res.objects:
-            return "" # Return empty if no match
-            
-        return "\n".join([o.properties['content'] for o in res.objects])
-    except Exception as e:
-        return f"Error: {str(e)}"
+        return "\n".join([o.properties['content'] for o in res.objects]) if res.objects else ""
+    except: return ""
 
 # --- 3. AGENTIC ENGINE ---
 def run_paa_engine(query):
-    st.session_state.trace = [] 
-    st.session_state.trace.append(f"🔍 **Analyzing Query:** {query}")
+    st.session_state.trace = []
+    st.session_state.agent_status = {"XML": False, "Web": False, "Docs": False}
+    st.session_state.trace.append(f"> 📥 Query Received: {query}")
     
-    # Routing Decision
-    analysis_prompt = f"""
-    Analyze query: "{query}"
-    If the query looks like a flight number (e.g., SV726, PK300), prioritize XML.
-    Scores (0-1): XML (Flight info), Web (Links), Docs (Baggage/Policy).
-    Return JSON: {{"XML": score, "Web": score, "Docs": score}}
-    """
-    
+    analysis_prompt = f"Analyze: '{query}'. Scores (0-1): XML, Web, Docs. Return JSON format."
     resp = client_openai.chat.completions.create(
-        model="gpt-4o-mini", 
-        response_format={"type":"json_object"}, 
-        messages=[{"role":"system", "content":"You are a PAA Supervisor Agent."}, {"role":"user","content":analysis_prompt}]
+        model="gpt-4o-mini", response_format={"type":"json_object"}, 
+        messages=[{"role":"system", "content":"You are a PAA Supervisor."}, {"role":"user","content":analysis_prompt}]
     )
     scores = json.loads(resp.choices[0].message.content)
+    st.session_state.trace.append(f"> 🤖 Routing Scores: {scores}")
 
     context = ""
     mapping = {"XML": "PAAWeb", "Web": "PAAWebLink", "Docs": "PAAPolicy"}
     
     for key, score in scores.items():
         if score >= THRESHOLD:
-            st.session_state.trace.append(f"📡 **{key} Agent:** Active (Score {score})")
-            retrieved_text = fetch_from_weaviate(query, mapping[key])
-            if retrieved_text:
-                context += f"\n--- {key} DATA ---\n{retrieved_text}\n"
+            st.session_state.agent_status[key] = True
+            st.session_state.trace.append(f"> 🔮 {key} Agent Activated (Score {score})")
+            retrieved = fetch_from_weaviate(query, mapping[key])
+            if retrieved: context += f"\n[{key}]: {retrieved}"
         else:
-            st.session_state.trace.append(f"⚪ **{key} Agent:** Bypassed")
+            st.session_state.trace.append(f"> ⚪ {key} Agent Bypassed")
 
-    # --- OPTION A: HYBRID PROMPT IMPLEMENTATION ---
-    system_instruction = f"""
-    You are the PAA (Pakistan Airports Authority) Official Assistant.
-
-    INSTRUCTIONS:
-    1. Primary Source: Use the CONTEXT DATA provided below to answer.
-    2. Fallback: If the CONTEXT DATA is empty, missing, or doesn't have details about "{query}", 
-       use your internal general knowledge to help the user.
-    3. Disclosure: If you use your own knowledge (and not the context), start with: 
-       "Based on general aviation information..." 
-    4. Accuracy: If you absolutely don't know something, only then say you don't have the data.
-
-    CONTEXT DATA:
-    {context if context else "No official records found for this query."}
-    """
-    
+    sys_inst = f"You are PAA Assistant. Use context if available, else general knowledge. \nContext: {context}"
     ans_resp = client_openai.chat.completions.create(
-        model="gpt-4o", 
-        messages=[{"role": "system", "content": system_instruction}] + st.session_state.messages[-5:] + [{"role": "user", "content": query}]
+        model="gpt-4o", messages=[{"role": "system", "content": sys_inst}] + st.session_state.messages[-3:] + [{"role": "user", "content": query}]
     )
     answer = ans_resp.choices[0].message.content
-    
+    st.session_state.trace.append("> ✅ Process Complete.")
     st.session_state.messages.append({"role": "user", "content": query})
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
-# --- 4. UI LAYOUT ---
-st.title("✈️ PAA AI: Enterprise Intelligence")
+# --- 4. THREE-COLUMN LAYOUT ---
+col1, col2, col3 = st.columns([1.2, 1.5, 2], gap="medium")
 
-with st.sidebar:
-    st.header("🔍 Agentic Trace")
-    for t in st.session_state.trace:
-        st.write(t)
-    if st.button("Clear Chat"):
-        st.session_state.messages = []
-        st.session_state.trace = []
+# COLUMN 1: Trace Console (Black)
+with col1:
+    st.markdown("### 📁 Trace Console")
+    if st.button("Clear All"):
+        st.session_state.messages, st.session_state.trace = [], []
         st.rerun()
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("Ask about flights, baggage or policies..."):
-    with st.chat_message("user"):
-        st.markdown(prompt)
     
-    with st.spinner("Collaborating with PAA Agents..."):
+    trace_content = "".join([f"<div style='margin-bottom:5px;'>{t}</div>" for t in st.session_state.trace])
+    st.markdown(f"<div class='trace-box'>{trace_content}</div>", unsafe_allow_html=True)
+
+# COLUMN 2: Agentic Flow Visualization (Dots)
+with col2:
+    st.markdown("### 🛠️ Agentic Flow Visualization")
+    st.write("")
+    # Supervisor
+    st.markdown("<center><div class='agent-dot dot-supervisor'></div><br><b>Supervisor Agent</b><br>↓</center>", unsafe_allow_html=True)
+    
+    v_col1, v_col2, v_col3 = st.columns(3)
+    agents = [("XML", v_col1), ("Web", v_col2), ("Docs", v_col3)]
+    
+    for name, col in agents:
+        status_class = "dot-active" if st.session_state.agent_status[name] else "dot-inactive"
+        with col:
+            st.markdown(f"<center><div class='agent-dot {status_class}'></div><br><b>{name} Agent</b><br>↓<br><small>RAG_{name}</small></center>", unsafe_allow_html=True)
+
+# COLUMN 3: PAA Smart Chat
+with col3:
+    st.markdown("### 💬 PAA Smart Chat")
+    chat_container = st.container(height=500)
+    with chat_container:
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]): st.markdown(m["content"])
+
+    if prompt := st.chat_input("Ask about flights, web links, or documents..."):
         run_paa_engine(prompt)
-    st.rerun()
+        st.rerun()
