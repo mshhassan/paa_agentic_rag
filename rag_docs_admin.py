@@ -1,124 +1,139 @@
 import streamlit as st
+from openai import OpenAI
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.config import Property, DataType, Configure
 from sentence_transformers import SentenceTransformer
-import os
-from pypdf import PdfReader
-import torch
+import json
 
-# --- CONFIG ---
-device = "cpu"
+# --- 1. CONFIG & INITIALIZATION ---
+st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
+
+# Initialize Session States
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "trace" not in st.session_state:
+    st.session_state.trace = []
+
+client_openai = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
 @st.cache_resource
-def load_model():
-    return SentenceTransformer('all-MiniLM-L6-v2', device=device)
+def load_resources():
+    model = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
+    return model
 
-MODEL = load_model()
-WEAVIATE_URL = st.secrets["WEAVIATE_URL"]
-WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
+EMBED = load_resources()
+THRESHOLD = 0.5 
 
-# Folder path jahan aap documents rakhenge
-DOCS_DIR = "rag_docs_data"
+# --- 2. WEAVIATE RETRIEVER ---
+def fetch_from_weaviate(query, collection_name):
+    try:
+        client = weaviate.connect_to_weaviate_cloud(
+            cluster_url=st.secrets["WEAVIATE_URL"],
+            auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
+        )
+        coll = client.collections.get(collection_name)
+        
+        res = coll.query.near_vector(
+            near_vector=EMBED.encode(query).tolist(), 
+            limit=5,
+            return_properties=["content"]
+        )
+        client.close()
+        
+        if not res.objects:
+            return ""
+            
+        return "\n".join([o.properties['content'] for o in res.objects])
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-# Agar folder nahi bana hua to bana dein
-if not os.path.exists(DOCS_DIR):
-    os.makedirs(DOCS_DIR)
-
-st.title("📂 RAG 3: Internal Docs Manager")
-st.info(f"Put your PDF or Text files in the `{DOCS_DIR}` folder in your Git repo.")
-
-# --- FILE SCANNING ---
-allowed_ext = [".pdf", ".txt", ".docx", ".md"]
-files = [f for f in os.listdir(DOCS_DIR) if any(f.lower().endswith(ext) for ext in allowed_ext)]
-
-if not files:
-    st.warning(f"No documents found in `{DOCS_DIR}`. Please upload files to Git first.")
-else:
-    # --- SESSION STATE FOR SELECTION ---
-    if "selected_files" not in st.session_state:
-        st.session_state.selected_files = []
-
-    st.write(f"### 📁 Found {len(files)} Documents")
+# --- 3. AGENTIC ENGINE ---
+def run_paa_engine(query):
+    st.session_state.trace = [] 
+    st.session_state.trace.append(f"🔍 **Analyzing Query:** {query}")
     
-    col1, col2 = st.columns(2)
+    # Routing Decision
+    analysis_prompt = f"""
+    Analyze query: "{query}"
+    If the query looks like a flight number (e.g., SV726, PK300), prioritize XML.
+    Scores (0-1): XML (Flight info), Web (Links), Docs (Baggage/Policy).
+    Return JSON: {{"XML": score, "Web": score, "Docs": score}}
+    """
     
-    if col1.button("✅ Select All"):
-        st.session_state.selected_files = files
-        st.rerun()
-
-    if col2.button("❌ Deselect All"):
-        st.session_state.selected_files = []
-        st.rerun()
-
-    # Multiselect provides the most stable "Select All" behavior in Streamlit
-    selected = st.multiselect(
-        "Select files to train:", 
-        options=files, 
-        default=st.session_state.selected_files,
-        key="file_selector"
+    resp = client_openai.chat.completions.create(
+        model="gpt-4o-mini", 
+        response_format={"type":"json_object"}, 
+        messages=[{"role":"system", "content":"You are a PAA Supervisor Agent."}, {"role":"user","content":analysis_prompt}]
     )
+    scores = json.loads(resp.choices[0].message.content)
 
-    # --- TRAINING LOGIC ---
-    if st.button("🏗️ Train / Update Vector Database"):
-        if not selected:
-            st.error("Please select at least one file to train.")
+    context = ""
+    mapping = {"XML": "PAAWeb", "Web": "PAAWebLink", "Docs": "PAAPolicy"}
+    
+    for key, score in scores.items():
+        if score >= THRESHOLD:
+            st.session_state.trace.append(f"📡 **{key} Agent:** Active (Score {score})")
+            retrieved_text = fetch_from_weaviate(query, mapping[key])
+            if retrieved_text:
+                context += f"\n--- {key} DATA ---\n{retrieved_text}\n"
         else:
-            client = weaviate.connect_to_weaviate_cloud(
-                cluster_url=WEAVIATE_URL, 
-                auth_credentials=Auth.api_key(WEAVIATE_KEY)
-            )
-            try:
-                collection_name = "PAAPolicy" 
-                
-                # Naya collection banane se pehle purana delete karein
-                if client.collections.exists(collection_name):
-                    client.collections.delete(collection_name)
-                
-                coll = client.collections.create(
-                    name=collection_name,
-                    vectorizer_config=Configure.Vectorizer.none(),
-                    properties=[Property(name="content", data_type=DataType.TEXT)]
-                )
-                
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                for i, file_name in enumerate(selected):
-                    file_path = os.path.join(DOCS_DIR, file_name)
-                    content = ""
-                    
-                    status_text.text(f"Processing: {file_name}...")
-                    
-                    try:
-                        if file_name.lower().endswith('.pdf'):
-                            reader = PdfReader(file_path)
-                            content = " ".join([p.extract_text() for p in reader.pages if p.extract_text()])
-                        else:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                content = f.read()
-                        
-                        # Overlap chunking (1000 chars with 200 overlap)
-                        chunk_size = 1000
-                        overlap = 200
-                        chunks = [content[j:j+chunk_size] for j in range(0, len(content), chunk_size - overlap)]
-                        
-                        # Batch insert chunks
-                        with coll.batch.dynamic() as batch:
-                            for c in chunks:
-                                if len(c.strip()) > 50:
-                                    meta_content = f"Source: {file_name} | {c}"
-                                    batch.add_object(
-                                        properties={"content": meta_content},
-                                        vector=MODEL.encode(c).tolist()
-                                    )
-                        
-                    except Exception as e:
-                        st.error(f"Failed to process {file_name}: {e}")
-                    
-                    progress_bar.progress((i + 1) / len(selected))
+            st.session_state.trace.append(f"⚪ **{key} Agent:** Bypassed")
 
-                status_text.empty()
-                st.success(f"🚀 RAG 3 is now updated with {len(selected)} documents!")
-                st.balloons()
-            finally:
-                client.close()
+    system_instruction = f"""
+    You are the PAA (Pakistan Airports Authority) Official Assistant.
+    INSTRUCTIONS:
+    1. Primary Source: Use the CONTEXT DATA below.
+    2. Fallback: If context is empty, use your internal knowledge.
+    3. Disclosure: If using internal knowledge, start with "Based on general aviation information..."
+    
+    CONTEXT DATA:
+    {context if context else "No official records found."}
+    """
+    
+    ans_resp = client_openai.chat.completions.create(
+        model="gpt-4o", 
+        messages=[{"role": "system", "content": system_instruction}] + st.session_state.messages[-5:] + [{"role": "user", "content": query}]
+    )
+    answer = ans_resp.choices[0].message.content
+    
+    st.session_state.messages.append({"role": "user", "content": query})
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+
+# --- 4. UI LAYOUT (SIDE-BY-SIDE) ---
+st.title("✈️ PAA AI: Enterprise Intelligence")
+
+# Main columns create kar rahe hain
+col_trace, col_chat = st.columns([1, 2])
+
+with col_trace:
+    st.subheader("🔍 Agentic Trace")
+    # Trace Box for visual separation
+    with st.container(border=True):
+        if not st.session_state.trace:
+            st.info("No query processed yet.")
+        for t in st.session_state.trace:
+            st.write(t)
+    
+    if st.button("🗑️ Clear Conversation"):
+        st.session_state.messages = []
+        st.session_state.trace = []
+        st.rerun()
+
+with col_chat:
+    st.subheader("💬 Chat Interface")
+    # Chat container for scrolling
+    chat_container = st.container(height=500)
+    
+    with chat_container:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask about SV726, baggage policy, etc..."):
+        with col_chat: # Ensure it renders in chat column
+            with st.chat_message("user"):
+                st.markdown(prompt)
+        
+        with st.spinner("Agents are thinking..."):
+            run_paa_engine(prompt)
+        st.rerun()
