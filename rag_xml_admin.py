@@ -1,37 +1,54 @@
 import streamlit as st
+import pandas as pd
+import xml.etree.ElementTree as ET
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.config import Property, DataType, Configure
 from sentence_transformers import SentenceTransformer
-import re
-import os
 
-WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud"
-WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
-MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+# Mapping logic function
+def get_mapping(df, code_col, name_col):
+    return pd.Series(df[name_col].values, index=df[code_col]).to_dict()
 
-st.title("📑 RAG 1: XML AODB Manager")
+def process_and_train():
+    # 1. Load CSV Mappings
+    try:
+        airline_map = get_mapping(pd.read_csv('rag_xml_data/airlines.csv'), 'IATACode', 'AirlineName')
+        airport_map = get_mapping(pd.read_csv('rag_xml_data/airports.csv'), 'IATACode', 'CityName')
+        status_map = get_mapping(pd.read_csv('rag_xml_data/status_codes.csv'), 'StatusCode', 'Description')
+        aircraft_map = get_mapping(pd.read_csv('rag_xml_data/aircraft_types.csv'), 'SubtypeCode', 'ModelName')
+    except Exception as e:
+        st.error(f"CSV Loading Error: {e}")
+        return
 
-if st.button("🔄 Sync Flight Records"):
-    if not os.path.exists("flight_records.xml"):
-        st.error("flight_records.xml nahi mili!")
-    else:
-        client = weaviate.connect_to_weaviate_cloud(cluster_url=WEAVIATE_URL, auth_credentials=Auth.api_key(WEAVIATE_KEY))
-        try:
-            if client.collections.exists("RAG1_XML"): client.collections.delete("RAG1_XML")
-            coll = client.collections.create(
-                name="RAG1_XML",
-                vectorizer_config=Configure.Vectorizer.none(),
-                properties=[Property(name="content", data_type=DataType.TEXT)]
-            )
-            with open("flight_records.xml", "r", encoding='utf-8') as f: xml_data = f.read()
-            blocks = re.findall(r'<(?:[a-zA-Z0-9]+:)?(?:AFDS)?FlightData>(.*?)</(?:[a-zA-Z0-9]+:)?(?:AFDS)?FlightData>', xml_data, re.DOTALL)
-            for b in blocks:
-                def get_v(tag):
-                    m = re.search(rf'<(?:[a-zA-Z0-9]+:)?{tag}[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?{tag}>', b, re.DOTALL)
-                    return m.group(1).strip() if m else "N/A"
-                f_id = get_v("FlightIdentity") or get_v("FlightNumber")
-                txt = f"Flight {f_id}: Date {get_v('ScheduledDate')}, Status {get_v('FlightStatusCode')}, Gate {get_v('GateIdentity')}, Belt {get_v('BaggageReclaimIdentity')}, Counter {get_v('CheckInDesks')}."
-                coll.data.insert(properties={"content": txt}, vector=MODEL.encode(txt).tolist())
-            st.success(f"✅ {len(blocks)} Flights Processed.")
-        finally: client.close()
+    # 2. Parse XML
+    tree = ET.parse('rag_xml_data/flight_snapshot.xml')
+    root = tree.getroot()
+    
+    enriched_data = []
+    
+    # XML tags parsing (Simplified for logic)
+    for flight in root.findall('.//FlightData'):
+        def get_t(tag): return flight.findtext(tag) or "N/A"
+        
+        # Mapping apply karein
+        airline = airline_map.get(get_t('CarrierIATACode'), get_t('CarrierIATACode'))
+        origin_dest = airport_map.get(get_t('PortOfCallIATACode'), get_t('PortOfCallIATACode'))
+        status = status_map.get(get_t('FlightStatusCode'), get_t('FlightStatusCode'))
+        aircraft = aircraft_map.get(get_t('AircraftSubtypeIATACode'), get_t('AircraftSubtypeIATACode'))
+        
+        # Enriched Narrative (RAG ke liye best format)
+        narrative = f"""
+        Flight {get_t('FlightIdentity')} ({get_t('ICAOFlightIdentifier')}) is a {get_t('FlightClassificationCode')} 
+        {'Arrival' if get_t('FlightDirection') == 'A' else 'Departure'} operated by {airline}.
+        Route: {origin_dest}, Sector: {'International' if get_t('FlightSectorCode') == 'I' else 'Domestic'}.
+        Status: {status}, Aircraft: {aircraft} (Reg: {get_t('AircraftRegistration')}), Capacity: {get_t('AircraftPassengerCapacity')}.
+        Timings: Scheduled at {get_t('ScheduledDate')}, Gate {get_t('GateNumber')} (Opens: {get_t('GateOpenDateTime')}, Closes: {get_t('GateCloseDateTime')}).
+        Check-in: Counters {get_t('CheckinDeskRange')} (Open: {get_t('CheckinOpenDateTime')}, Close: {get_t('CheckinCloseDateTime')}).
+        Arrival Info: Belt/Carousel {get_t('BaggageReclaimCarouselID')}, Stand {get_t('StandPosition')}.
+        Handling: {get_t('HandlingAgentService')} by {get_t('HandlingAgentIATACode')}.
+        """
+        enriched_data.append(narrative)
+
+    # 3. Batch Upload to Weaviate
+    # (Yahan purana Weaviate upload code use karein jo 'PAAWeb' collection mein save kare)
+    st.success(f"Enriched {len(enriched_data)} flights with full descriptions!")
