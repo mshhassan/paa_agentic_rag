@@ -70,12 +70,15 @@ def run_paa_engine(query):
     
     # Improved Prompt for better JSON reliability
     analysis_prompt = f"""
-    Analyze the user query: '{query}'
-    Provide scores between 0.0 and 1.0 for each agent based on relevance.
-    XML: Flight status/schedules
-    Web: Official links/websites
-    Docs: Policies/Baggage/Rules
-    Return EXACTLY this JSON format: {{"XML": 0.0, "Web": 0.0, "Docs": 0.0}}
+    Analyze query: "{query}"
+    
+    RULES:
+    1. If the query contains a flight number (like SV122, PK300) or asks for flight schedule/status, 
+       GIVE XML a score of 1.0 and Web a score of 0.0.
+    2. If the query asks for official links or "where to find" something online, GIVE Web a score of 1.0.
+    3. If the query is about baggage, rules, or policies, GIVE Docs a score of 1.0.
+    
+    Return JSON: {{"XML": score, "Web": score, "Docs": score}}
     """
     
     try:
