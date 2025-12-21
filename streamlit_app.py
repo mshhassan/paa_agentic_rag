@@ -2,101 +2,73 @@ import streamlit as st
 from openai import OpenAI
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.config import Property, DataType, Configure
 import json
 import re
-import warnings
+import os
 from sentence_transformers import SentenceTransformer
+from pypdf import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-warnings.filterwarnings("ignore")
-
-# --- 1. INITIALIZATION & RESOURCE LOADING ---
-try:
-    WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud"
-    WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-    client_openai = OpenAI(api_key=OPENAI_API_KEY)
-except KeyError as e:
-    st.error(f"Secret Missing: {e}")
-    st.stop()
+# --- 1. CONFIGURATION ---
+WEAVIATE_URL = "04xfvperaudv4jaql4uq.c0.asia-southeast1.gcp.weaviate.cloud"
+WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+client_openai = OpenAI(api_key=OPENAI_API_KEY)
 
 @st.cache_resource
 def load_resources():
     model = SentenceTransformer('all-MiniLM-L6-v2')
-    client = weaviate.connect_to_weaviate_cloud(
-        cluster_url=WEAVIATE_URL,
-        auth_credentials=Auth.api_key(WEAVIATE_KEY)
-    )
+    client = weaviate.connect_to_weaviate_cloud(cluster_url=WEAVIATE_URL, auth_credentials=Auth.api_key(WEAVIATE_KEY))
     return model, client
 
 EMBEDDING_MODEL, W_CLIENT = load_resources()
 
-# --- 2. THE MASTER INGESTOR (Operational Data) ---
-def initialize_knowledge_base():
-    """Wipes and re-creates all 3 pillars of the PAA Knowledge Base."""
-    collections = {
-        "PAAFlightStatus": "Flight records, timings, gates, and status.",
-        "PAAPolicy": "PDF Documents, baggage rules, and passenger rights.",
-        "PAAWebLink": "Official URLs for Lost & Found, NOTAMs, and Services."
-    }
+# --- 2. PDF PROCESSING FUNCTION ---
+def process_uploaded_pdf(uploaded_file):
+    reader = PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
     
-    for coll_name in collections:
-        if W_CLIENT.collections.exists(coll_name):
-            W_CLIENT.collections.delete(coll_name)
-        W_CLIENT.collections.create(
-            name=coll_name,
-            properties=[Property(name="content", data_type=DataType.TEXT)],
-            vectorizer_config=Configure.Vectorizer.none()
-        )
+    # Text splitting for better RAG retrieval
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = splitter.split_text(text)
+    
+    coll = W_CLIENT.collections.get("PAAPolicy")
+    for chunk in chunks:
+        vector = EMBEDDING_MODEL.encode(chunk).tolist()
+        coll.data.insert(properties={"content": chunk, "category": "pdf_upload"}, vector=vector)
+    return len(chunks)
 
-    # A. Ingest Web Links (Operational Links)
-    web_data = [
-        {"content": "Lost and Found Baggage Procedures", "url": "https://www.paa.gov.pk/lost-found"},
-        {"content": "NOTAMs and Aeronautical Information", "url": "https://www.paa.gov.pk/notams"},
-        {"content": "Passenger Facilitation & Complaint Cell", "url": "https://www.paa.gov.pk/complaints"}
-    ]
-    web_coll = W_CLIENT.collections.get("PAAWebLink")
-    for item in web_data:
-        text = f"{item['content']} URL: {item['url']}"
-        web_coll.data.insert(properties={"content": text}, vector=EMBEDDING_MODEL.encode(text).tolist())
+# --- 3. REFINED SUB-AGENTS ---
+def flight_inquiry_agent(query):
+    coll = W_CLIENT.collections.get("PAAFlightStatus")
+    # Priority keyword search (alpha=0.4)
+    res = coll.query.hybrid(query=query, vector=EMBEDDING_MODEL.encode(query).tolist(), limit=3, alpha=0.4)
+    return "\n---\n".join([o.properties['content'] for o in res.objects]) if res.objects else "No flight data found."
 
-    return "✅ Knowledge Base Initialized!"
+def policy_agent(query):
+    coll = W_CLIENT.collections.get("PAAPolicy")
+    res = coll.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=3)
+    return "\n---\n".join([o.properties['content'] for o in res.objects]) if res.objects else "No policy info found."
 
-# --- 3. SUB-AGENTS (The Specialized Workers) ---
+def web_agent(query):
+    coll = W_CLIENT.collections.get("PAAWebLink")
+    res = coll.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=3)
+    return "\n---\n".join([o.properties['content'] for o in res.objects]) if res.objects else "No links found."
 
-def retrieval_agent(query, collection_name):
-    """Generic retrieval for any PAA collection."""
-    try:
-        coll = W_CLIENT.collections.get(collection_name)
-        # Using Hybrid search to prioritize keywords like 'Lost' or 'PK841'
-        response = coll.query.hybrid(
-            query=query, 
-            vector=EMBEDDING_MODEL.encode(query).tolist(), 
-            limit=3,
-            alpha=0.5
-        )
-        return "\n".join([o.properties.get('content', '') for o in response.objects])
-    except:
-        return ""
-
-# --- 4. MASTER SUPERVISOR (The Logic Brain) ---
-
-def paa_supervisor(user_input):
-    # Tools definition
+# --- 4. SUPERVISOR LOGIC ---
+def supervisor_agent(user_input):
     tools = [
-        {"type": "function", "function": {"name": "get_flight_info", "description": "Search flight AODB data.", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}},
-        {"type": "function", "function": {"name": "get_policy_info", "description": "Search passenger policies/PDFs.", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}},
-        {"type": "function", "function": {"name": "get_web_links", "description": "Get official PAA website links.", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}
+        {"type": "function", "function": {"name": "flight_inquiry_agent", "description": "Get detailed flight, gate, counter info.", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}},
+        {"type": "function", "function": {"name": "policy_agent", "description": "Search baggage rules and passenger policies.", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}},
+        {"type": "function", "function": {"name": "web_agent", "description": "Get official PAA website links.", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}
     ]
 
-    system_prompt = """You are the PAA Operational Intelligence Agent.
-    - If asked for links (Lost & Found, NOTAMs), use 'get_web_links'.
-    - If asked for flights, use 'get_flight_info'. Mention Gates/Counters clearly.
-    - For Weather in Islamabad: State it's approx 10-15°C (Dec average) if tools have no data.
-    - Provide raw data as clickable links for URLs.
-    Today: Dec 21, 2025."""
-
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}]
+    messages = [
+        {"role": "system", "content": "You are the PAA Master Agent. Provide comprehensive flight details (Gate, Belt, Counter) and official links. Use bullet points."},
+        {"role": "user", "content": user_input}
+    ]
     
     response = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=tools)
     msg = response.choices[0].message
@@ -105,37 +77,37 @@ def paa_supervisor(user_input):
         messages.append(msg)
         for tc in msg.tool_calls:
             q = json.loads(tc.function.arguments).get('q')
-            if tc.function.name == "get_flight_info": res = retrieval_agent(q, "PAAFlightStatus")
-            elif tc.function.name == "get_policy_info": res = retrieval_agent(q, "PAAPolicy")
-            else: res = retrieval_agent(q, "PAAWebLink")
-            messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": res or "No data found."})
+            if tc.function.name == "flight_inquiry_agent": res = flight_inquiry_agent(q)
+            elif tc.function.name == "policy_agent": res = policy_agent(q)
+            else: res = web_agent(q)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": res})
         
         final = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
         return final.choices[0].message.content
     return msg.content
 
-# --- 5. INTERFACE ---
-st.set_page_config(page_title="PAA Operations", layout="wide")
+# --- 5. STREAMLIT UI ---
+st.set_page_config(page_title="PAA Master RAG", layout="wide")
 
+# Sidebar for PDF Upload
 with st.sidebar:
-    st.title("⚙️ Admin Panel")
-    if st.button("🔄 Sync PAA Data"):
-        with st.spinner("Processing XML & Web Links..."):
-            status = initialize_knowledge_base()
-            st.success(status)
+    st.header("📂 Knowledge Management")
+    uploaded_pdf = st.file_uploader("Upload PAA Policy PDF", type="pdf")
+    if uploaded_pdf:
+        with st.spinner("Indexing PDF into RAG..."):
+            num_chunks = process_uploaded_pdf(uploaded_pdf)
+            st.success(f"Indexed {num_chunks} chunks from PDF!")
 
-st.title("✈️ PAA.GOV.PK Operational RAG")
-st.markdown("Query flight data, passenger policies, and official resources directly.")
+st.title("✈️ PAA.GOV.PK Operations")
 
 if "messages" not in st.session_state: st.session_state.messages = []
-
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("How do I contact Lost and Found and what is status of PK841?"):
+if prompt := st.chat_input("Ex: What is the baggage policy and status of PK841?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     with st.chat_message("assistant"):
-        response = paa_supervisor(prompt)
-        st.markdown(response)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        ans = supervisor_agent(prompt)
+        st.markdown(ans)
+        st.session_state.messages.append({"role": "assistant", "content": ans})
