@@ -68,34 +68,59 @@ def run_paa_engine(query):
     st.session_state.agent_status = {"XML": False, "Web": False, "Docs": False}
     st.session_state.trace.append(f"> 📥 Query Received: {query}")
     
-    analysis_prompt = f"Analyze: '{query}'. Scores (0-1): XML, Web, Docs. Return JSON format."
-    resp = client_openai.chat.completions.create(
-        model="gpt-4o-mini", response_format={"type":"json_object"}, 
-        messages=[{"role":"system", "content":"You are a PAA Supervisor."}, {"role":"user","content":analysis_prompt}]
-    )
-    scores = json.loads(resp.choices[0].message.content)
-    st.session_state.trace.append(f"> 🤖 Routing Scores: {scores}")
-
-    context = ""
-    mapping = {"XML": "PAAWeb", "Web": "PAAWebLink", "Docs": "PAAPolicy"}
+    # Improved Prompt for better JSON reliability
+    analysis_prompt = f"""
+    Analyze the user query: '{query}'
+    Provide scores between 0.0 and 1.0 for each agent based on relevance.
+    XML: Flight status/schedules
+    Web: Official links/websites
+    Docs: Policies/Baggage/Rules
+    Return EXACTLY this JSON format: {{"XML": 0.0, "Web": 0.0, "Docs": 0.0}}
+    """
     
-    for key, score in scores.items():
-        if score >= THRESHOLD:
-            st.session_state.agent_status[key] = True
-            st.session_state.trace.append(f"> 🔮 {key} Agent Activated (Score {score})")
-            retrieved = fetch_from_weaviate(query, mapping[key])
-            if retrieved: context += f"\n[{key}]: {retrieved}"
-        else:
-            st.session_state.trace.append(f"> ⚪ {key} Agent Bypassed")
+    try:
+        resp = client_openai.chat.completions.create(
+            model="gpt-4o-mini", 
+            response_format={"type":"json_object"}, 
+            messages=[{"role":"system", "content":"You are a PAA Supervisor. Always return numeric scores in JSON."}, 
+                      {"role":"user","content":analysis_prompt}]
+        )
+        scores = json.loads(resp.choices[0].message.content)
+        st.session_state.trace.append(f"> 🤖 Routing Scores: {scores}")
 
-    sys_inst = f"You are PAA Assistant. Use context if available, else general knowledge. \nContext: {context}"
-    ans_resp = client_openai.chat.completions.create(
-        model="gpt-4o", messages=[{"role": "system", "content": sys_inst}] + st.session_state.messages[-3:] + [{"role": "user", "content": query}]
-    )
-    answer = ans_resp.choices[0].message.content
-    st.session_state.trace.append("> ✅ Process Complete.")
-    st.session_state.messages.append({"role": "user", "content": query})
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        context = ""
+        mapping = {"XML": "PAAWeb", "Web": "PAAWebLink", "Docs": "PAAPolicy"}
+        
+        # Safety Check for keys in scores
+        for key in ["XML", "Web", "Docs"]:
+            # Check if key exists and is a valid number
+            score = scores.get(key, 0.0) 
+            if isinstance(score, (int, float)) and score >= THRESHOLD:
+                st.session_state.agent_status[key] = True
+                st.session_state.trace.append(f"> 🔮 {key} Agent Activated (Score {score})")
+                retrieved = fetch_from_weaviate(query, mapping[key])
+                if retrieved: 
+                    context += f"\n--- {key} DATA ---\n{retrieved}\n"
+            else:
+                st.session_state.trace.append(f"> ⚪ {key} Agent Bypassed")
+
+        sys_inst = f"""You are the PAA Official Assistant. 
+        Use the provided context to answer. If context is missing, use general knowledge.
+        Context: {context}"""
+        
+        ans_resp = client_openai.chat.completions.create(
+            model="gpt-4o", 
+            messages=[{"role": "system", "content": sys_inst}] + st.session_state.messages[-3:] + [{"role": "user", "content": query}]
+        )
+        answer = ans_resp.choices[0].message.content
+        
+        st.session_state.trace.append("> ✅ Process Complete.")
+        st.session_state.messages.append({"role": "user", "content": query})
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        
+    except Exception as e:
+        st.error(f"Error in Engine: {e}")
+        st.session_state.trace.append(f"> ❌ Error: {str(e)}")
 
 # --- 4. THREE-COLUMN LAYOUT ---
 col1, col2, col3 = st.columns([1.2, 1.5, 2], gap="medium")
