@@ -32,106 +32,113 @@ def load_resources():
 
 EMBEDDING_MODEL, W_CLIENT = load_resources()
 
-# --- 2. IMPROVED SUB-AGENTS ---
+# --- 2. LOGGING CONSOLE HELPER ---
+def log_agent_activity(agent_name, message):
+    if "agent_logs" not in st.session_state:
+        st.session_state.agent_logs = []
+    log_entry = f"[{agent_name.upper()}]: {message}"
+    st.session_state.agent_logs.append(log_entry)
+    # Update sidebar console live
+    with st.sidebar:
+        st.code("\n".join(st.session_state.agent_logs[-15:]), language="bash")
+
+# --- 3. UPDATED SUB-AGENTS ---
 
 def flight_inquiry_agent(query):
-    """Sub-Agent: AODB Specialist"""
-    query_vector = EMBEDDING_MODEL.encode(query).tolist()
+    log_agent_activity("Flight-Agent", f"Searching AODB for query: {query}")
     coll = W_CLIENT.collections.get("PAAFlightStatus")
     
-    # Exact flight number match is crucial for AODB
-    match = re.search(r'([A-Z]{2}\d{2,4})', query.upper())
-    f_filter = Filter.by_property("flight_num").equal(match.group(1)) if match else None
+    # Hybrid Search (Weighting Keyword more for J2143 accuracy)
+    response = coll.query.hybrid(
+        query=query,
+        vector=EMBEDDING_MODEL.encode(query).tolist(),
+        limit=3,
+        alpha=0.3
+    )
     
-    response = coll.query.near_vector(near_vector=query_vector, limit=5, filters=f_filter)
     if not response.objects:
-        return "DATABASE_EMPTY: No specific flight record found for this query."
-    return "\n".join([o.properties.get('content', '') for o in response.objects])
+        log_agent_activity("Flight-Agent", "Result: Empty")
+        return "No specific flight record found."
+    
+    results = [o.properties.get('content', '') for o in response.objects]
+    log_agent_activity("Flight-Agent", f"Found {len(results)} records.")
+    return "\n".join(results)
 
 def policy_documentation_agent(query):
-    """Sub-Agent: PDF Policy Expert (Baggage, NOTAMs, Lost & Found)"""
-    query_vector = EMBEDDING_MODEL.encode(query).tolist()
+    log_agent_activity("Policy-Agent", f"Reading PDF docs for: {query}")
     coll = W_CLIENT.collections.get("PAAPolicy")
-    # Increase limit to capture more context
-    response = coll.query.near_vector(near_vector=query_vector, limit=5)
+    response = coll.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=3)
     return "\n".join([o.properties.get('content', '') for o in response.objects]) if response.objects else "No documents found."
 
 def web_query_agent(query):
-    """Sub-Agent: Web URL Expert"""
-    query_vector = EMBEDDING_MODEL.encode(query).tolist()
+    log_agent_activity("Web-Agent", f"Checking PAA Web Links for: {query}")
     coll = W_CLIENT.collections.get("PAAWebLink")
-    response = coll.query.near_vector(near_vector=query_vector, limit=8)
-    
-    links = []
-    for o in response.objects:
-        url = o.properties.get('url_href', '#')
-        text = o.properties.get('content', '')
-        links.append(f"🔗 [{text}]({url})")
-    
+    response = coll.query.near_vector(near_vector=EMBEDDING_MODEL.encode(query).tolist(), limit=5)
+    links = [f"🔗 [{o.properties.get('content', '')}]({o.properties.get('url_href', '#')})" for o in response.objects]
     return "\n".join(links) if links else "No web links found."
 
-# --- 3. MASTER SUPERVISOR ---
+# --- 4. MASTER SUPERVISOR ---
 
 def supervisor_agent(user_input):
+    log_agent_activity("Supervisor", "Analyzing query and delegating tools...")
+    
     tools = [
         {"type": "function", "function": {
             "name": "flight_inquiry_agent", 
-            "description": "Get flight timings. Reformat date to YYYY-MM-DD.",
+            "description": "Get flight timings and status.",
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }},
         {"type": "function", "function": {
             "name": "policy_documentation_agent", 
-            "description": "Baggage rules, NOTAMs, and Lost & Found procedures.",
+            "description": "Baggage, NOTAMs, and Lost & Found procedures.",
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }},
         {"type": "function", "function": {
             "name": "web_query_agent", 
-            "description": "Official PAA links for NOTAMs and Lost and Found.",
+            "description": "Official PAA website links.",
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }}
     ]
 
-    system_msg = """You are the PAA Master Supervisor.
-    1. WEATHER: Provide typical weather from your own knowledge.
-    2. FLIGHTS: Always reformat dates to ISO format.
-    3. SEARCH LOGIC: If a user asks for 'NOTAMs' or 'Lost and Found', you MUST call 'web_query_agent' AND 'policy_documentation_agent' with the EXACT keywords 'NOTAM' or 'Lost and Found'.
-    4. LINKS: If the web agent returns links, display them as clickable Markdown links.
-    Today is Dec 21, 2025."""
-
-    messages = [{"role": "system", "content": system_msg}]
-    for m in st.session_state.messages[-6:]:
-        messages.append({"role": m["role"], "content": m["content"]})
-    messages.append({"role": "user", "content": user_input})
+    messages = [
+        {"role": "system", "content": "You are the PAA Master Supervisor. Be concise. Today: Dec 21, 2025."},
+        {"role": "user", "content": user_input}
+    ]
 
     response = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=tools)
     msg = response.choices[0].message
 
     if msg.tool_calls:
         messages.append(msg)
-        with st.status("🤖 Supervisor Delegating Parallel Tasks...", expanded=True):
-            agent_map = {
-                "flight_inquiry_agent": flight_inquiry_agent,
-                "policy_documentation_agent": policy_documentation_agent,
-                "web_query_agent": web_query_agent
-            }
-            
-            with ThreadPoolExecutor() as executor:
-                futures = {executor.submit(agent_map[tc.function.name], json.loads(tc.function.arguments).get('query')): tc for tc in msg.tool_calls}
-                for future in futures:
-                    tc = futures[future]
-                    result = future.result()
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": result})
+        agent_map = {
+            "flight_inquiry_agent": flight_inquiry_agent,
+            "policy_documentation_agent": policy_documentation_agent,
+            "web_query_agent": web_query_agent
+        }
         
+        for tc in msg.tool_calls:
+            arg_query = json.loads(tc.function.arguments).get('query')
+            result = agent_map[tc.function.name](arg_query)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": result})
+        
+        log_agent_activity("Supervisor", "Synthesizing final answer from agents...")
         final_res = client_openai.chat.completions.create(model="gpt-4o-mini", messages=messages)
         return final_res.choices[0].message.content
     
     return msg.content
 
-# --- 4. STREAMLIT UI ---
+# --- 5. STREAMLIT UI ---
 st.set_page_config(page_title="PAA Master Agent", layout="wide")
+
+# Sidebar Console
+with st.sidebar:
+    st.header("🕵️ Agent Logic Trace")
+    st.markdown("---")
+    if st.button("Clear Logs"):
+        st.session_state.agent_logs = []
+    st.write("Live Execution Path:")
+
 st.title("🏢 PAA Intelligent Master Agent")
-
-
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -139,7 +146,7 @@ if "messages" not in st.session_state:
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-if prompt := st.chat_input("Ex: Show me the link for NOTAMs and flight SV726?"):
+if prompt := st.chat_input("Ex: Status of J2143?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
     with st.chat_message("assistant"):
