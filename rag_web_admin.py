@@ -10,6 +10,10 @@ import urllib3
 import re
 import time
 
+
+import os
+os.environ['CURL_CA_BUNDLE'] = ''
+
 # SSL/Security Warnings bypass (Necessary for gov sites)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
