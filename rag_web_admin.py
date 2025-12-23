@@ -4,86 +4,51 @@ from weaviate.classes.init import Auth
 from weaviate.classes.config import Property, DataType, Configure
 from sentence_transformers import SentenceTransformer
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import urllib3
-import re
 import time
 
-
-import os
-os.environ['CURL_CA_BUNDLE'] = ''
-
-# SSL/Security Warnings bypass (Necessary for gov sites)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# --- 1. MODEL & CONFIG ---
+# --- CONFIG ---
 @st.cache_resource
-def load_resources():
+def load_model():
     return SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
 
-MODEL = load_resources()
+MODEL = load_model()
 WEAVIATE_URL = st.secrets["WEAVIATE_URL"]
 WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
 
-st.set_page_config(page_title="PAA Web RAG Admin", layout="wide", page_icon="🌐")
-st.title("🌐 PAA Enterprise Web Indexer")
-st.markdown("---")
+st.title("🌐 PAA Smart Web Indexer")
+st.markdown("Agar PAA ki site block bhi kare, tab bhi ye data nikaal lega!")
 
-# --- 2. ADVANCED DISCOVERY (Deep Crawl) ---
-def discover_paa_links(base_url):
+# --- JINA READER FUNCTION (The Secret Sauce) ---
+def scrape_with_jina(url):
+    # Jina Reader URL ko simple text mein badal deta hai
+    jina_url = f"https://r.jina.ai/{url}"
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
-        response = requests.get(base_url, headers=headers, timeout=20, verify=False)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        links = set()
-        
-        # PAA ki website ke patterns ko target karna
-        for a in soup.find_all('a', href=True):
-            full_url = urljoin(base_url, a['href']).split('#')[0].rstrip('/')
-            
-            # Domain check aur unwanted files filtering
-            if urlparse(base_url).netloc in urlparse(full_url).netloc:
-                excluded = ['.pdf', '.jpg', '.png', '.zip', '.docx', '.xlsx', 'logout', 'login']
-                if not any(ext in full_url.lower() for ext in excluded):
-                    links.add(full_url)
-        
-        return sorted(list(links))
+        response = requests.get(jina_url, timeout=30)
+        if response.status_code == 200:
+            return response.text # Yeh humein saaf suthra text dega
+        else:
+            return None
     except Exception as e:
-        st.error(f"Discovery Error: {e}")
-        return ["https://www.paa.gov.pk"]
+        st.error(f"Error scraping {url}: {e}")
+        return None
 
-# Session state to manage discovered links
-if "discovered_links" not in st.session_state:
-    with st.spinner("🔍 Mapping PAA Website Structure..."):
-        st.session_state.discovered_links = discover_paa_links("https://www.paa.gov.pk")
+# --- URL LIST ---
+urls_to_index = [
+    "https://paa.gov.pk/about-us/introduction",
+    "https://paa.gov.pk/e-complains",
+    "https://paa.gov.pk/passenger-information/passenger-guide",
+    "https://paa.gov.pk/media/job-opportunities",
+    "https://paa.gov.pk/e-services/e-notam"
+]
 
-# --- 3. UI LAYOUT ---
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.subheader("Settings")
-    chunk_size = st.slider("Chunk Size", 500, 1500, 800)
-    overlap = st.slider("Overlap", 50, 300, 150)
-    st.info("Large overlap preserves context between chunks.")
-
-with col2:
-    st.subheader("URLs to Index")
-    selected_links = st.text_area("URLs List (Editable):", 
-                                  value="\n".join(st.session_state.discovered_links), 
-                                  height=300)
-
-# --- 4. CORE INDEXING ENGINE (Smart Batching) ---
-if st.button("🚀 Start Carrier-Grade Indexing"):
-    target_urls = [l.strip() for l in selected_links.split('\n') if l.strip()]
-    
+if st.button("🚀 Start Intelligent Scraping"):
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=WEAVIATE_URL, 
         auth_credentials=Auth.api_key(WEAVIATE_KEY)
     )
     
     try:
-        # Re-create collection for fresh data
+        # Collection Fresh karein
         if client.collections.exists("RAG2_Web"):
             client.collections.delete("RAG2_Web")
         
@@ -92,60 +57,38 @@ if st.button("🚀 Start Carrier-Grade Indexing"):
             vectorizer_config=Configure.Vectorizer.none(),
             properties=[
                 Property(name="content", data_type=DataType.TEXT),
-                Property(name="source", data_type=DataType.TEXT),
-                Property(name="page_title", data_type=DataType.TEXT)
+                Property(name="source", data_type=DataType.TEXT)
             ]
         )
 
-        progress_bar = st.progress(0)
-        log_box = st.empty()
-
-        for idx, url in enumerate(target_urls):
-            try:
-                # Scraping with timeout & retries
-                res = requests.get(url, timeout=15, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
-                soup = BeautifulSoup(res.text, 'html.parser')
-                
-                # Metadata extraction
-                title = soup.title.string if soup.title else "PAA Page"
-                
-                # Heavy Noise Cleaning (Removing headers, footers, scripts)
-                for tag in soup(["script", "style", "nav", "footer", "header", "form"]): 
-                    tag.decompose()
-                
-                # Content Cleaning
-                raw_text = soup.get_text(separator=' ', strip=True)
-                clean_text = re.sub(r"\s+", " ", raw_text)
-
-                # --- SMART OVERLAP CHUNKING ---
-                chunks = [clean_text[j:j+chunk_size] for j in range(0, len(clean_text), chunk_size - overlap)]
-
-                with coll.batch.dynamic() as batch:
-                    for c in chunks:
-                        if len(c.strip()) > 150:
-                            # Embedding each chunk
-                            vector = MODEL.encode(c).tolist()
-                            
-                            # Injecting Source and Context into Content (Critical for LLM)
-                            enriched_content = f"WEBSITE: {title} | URL: {url} | DATA: {c}"
-                            
-                            batch.add_object(
-                                properties={
-                                    "content": enriched_content,
-                                    "source": url,
-                                    "page_title": title
-                                },
-                                vector=vector
-                            )
-                log_box.success(f"Successfully Indexed: {url}")
-            except Exception as e:
-                log_box.error(f"Failed to process {url}: {e}")
+        progress = st.progress(0)
+        for i, url in enumerate(urls_to_index):
+            st.write(f"🔍 Reading: {url}...")
             
-            progress_bar.progress((idx + 1) / len(target_urls))
-            time.sleep(0.1) # Prevent rate limiting
+            # Jina use kar ke text nikalna
+            text_content = scrape_with_jina(url)
+            
+            if text_content and len(text_content) > 100:
+                # Chote chunks mein break karna (800 chars)
+                chunks = [text_content[j:j+800] for j in range(0, len(text_content), 650)]
+                
+                with coll.batch.dynamic() as batch:
+                    for chunk in chunks:
+                        # Embedding banana
+                        vec = MODEL.encode(chunk).tolist()
+                        batch.add_object(
+                            properties={"content": chunk, "source": url},
+                            vector=vec
+                        )
+                st.success(f"✅ Indexed: {url} ({len(chunks)} chunks)")
+            else:
+                st.warning(f"⚠️ No content found for {url}")
+            
+            progress.progress((i + 1) / len(urls_to_index))
+            time.sleep(1) # Aram se scraping
 
-        st.success("🎯 Carrier-Grade Knowledge Base is Ready!")
         st.balloons()
+        st.success("🎯 Ab aapka DB bhar chuka hai! Chatbot se check karein.")
 
     finally:
         client.close()
