@@ -26,7 +26,7 @@ MODEL = load_resources()
 WEAVIATE_URL = st.secrets["WEAVIATE_URL"]
 WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
 
-st.set_page_config(page_title="PAA Intelligence Admin", layout="wide", page_icon="🌐")
+st.set_page_config(page_title="PAA Web RAG Admin", layout="wide", page_icon="🌐")
 st.title("🌐 PAA Enterprise Web Indexer")
 st.markdown("---")
 
