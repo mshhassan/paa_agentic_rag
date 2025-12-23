@@ -8,7 +8,6 @@ import re
 
 # ================= CONFIG =================
 st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
-
 client_openai = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 @st.cache_resource
@@ -39,101 +38,53 @@ def weaviate_search(query, collection):
             auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
         )
         coll = client.collections.get(collection)
-        res = coll.query.near_vector(
+
+        # 🔹 EXACT MATCH
+        exact = coll.query.fetch_objects(
+            filters={
+                "path": ["flight_number"],
+                "operator": "Equal",
+                "valueText": query
+            },
+            limit=1
+        )
+
+        if exact.objects:
+            client.close()
+            return [o.properties for o in exact.objects]
+
+        # 🔹 SEMANTIC FALLBACK
+        semantic = coll.query.near_vector(
             near_vector=EMBED.encode(query).tolist(),
             limit=3
         )
         client.close()
-        return [o.properties["content"] for o in res.objects]
-    except:
+        if semantic.objects:
+            return [o.properties for o in semantic.objects]
+
         return []
 
-#====================
-
-def fetch_flight_exact_or_semantic(flight_no):
-    client = weaviate.connect_to_weaviate_cloud(
-        cluster_url=st.secrets["WEAVIATE_URL"],
-        auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
-    )
-
-    coll = client.collections.get("PAA_XML_FLIGHTS")
-
-    # 1️⃣ EXACT MATCH FIRST
-    exact = coll.query.fetch_objects(
-        filters={
-            "path": ["flight_number"],
-            "operator": "Equal",
-            "valueText": flight_no
-        },
-        limit=1
-    )
-
-    if exact.objects:
-        client.close()
-        return exact.objects[0].properties
-
-    # 2️⃣ SEMANTIC FALLBACK
-    semantic = coll.query.near_vector(
-        near_vector=EMBED.encode(flight_no).tolist(),
-        limit=1
-    )
-
-    client.close()
-    if semantic.objects:
-        return semantic.objects[0].properties
-
-    return None
-
-
-
+    except Exception as e:
+        st.warning(f"Weaviate search failed: {e}")
+        return []
 
 # ================= SUPERVISOR =================
 def supervisor_router(query):
-    routing_prompt = f"""
-You are an intent and scope analyzer.
-
-Decide which agents are required for the user query.
-
-AGENTS:
-- XML_AGENT → flight status, arrival, departure, gate, check-in
-- DOC_AGENT → baggage, hand carry, check-in baggage rules
-- WEB_AGENT → paa.gov.pk notices, tenders, official info
-- NONE → greetings or casual talk
-
-Rules:
-- A query may require more than one agent.
-- Include XML_AGENT if a flight number is mentioned.
-- Include DOC_AGENT if baggage, luggage, hand carry, or check-in baggage is mentioned.
-- Include WEB_AGENT only for website or official notices.
-- Return NONE only if no agent applies.
-
-Return JSON only.
-
-Example:
-{{ "agents": ["XML_AGENT", "DOC_AGENT"] }}
-
-Query:
-"{query}"
-"""
-
-    # 🔹 Soft signal detection (NOT override)
+    """
+    Determines which agents are relevant for a query.
+    """
+    # Regex hints
     flight_hint = bool(re.search(r"\b[A-Z]{2}\d{2,4}\b", query, re.I))
     baggage_hint = bool(re.search(r"\bbaggage|luggage|hand\s?carry|check[- ]?in\b", query, re.I))
+    web_hint = bool(re.search(r"website|notice|tender|official", query, re.I))
 
-    resp = client_openai.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": routing_prompt}]
-    )
-
-    agents = json.loads(resp.choices[0].message.content).get("agents", [])
-
-    # 🔹 Safety net (merge hints, don't replace)
-    if flight_hint and "XML_AGENT" not in agents:
+    agents = []
+    if flight_hint:
         agents.append("XML_AGENT")
-
-    if baggage_hint and "DOC_AGENT" not in agents:
+    if baggage_hint:
         agents.append("DOC_AGENT")
+    if web_hint:
+        agents.append("WEB_AGENT")
 
     if not agents:
         agents = ["NONE"]
@@ -158,16 +109,15 @@ def run_engine(user_query):
     st.session_state.agent_status = {k: False for k in st.session_state.agent_status}
 
     st.session_state.trace.append(f"📥 User Query: {user_query}")
-
     agents = supervisor_router(user_query)
     st.session_state.trace.append(f"🧠 Supervisor Routing: {agents}")
 
     if agents == ["NONE"]:
+        # Fallback to OpenAI direct answer
         answer = client_openai.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": user_query}]
         ).choices[0].message.content
-
         return answer
 
     sub_queries = decompose_query(user_query, agents)
@@ -179,7 +129,7 @@ def run_engine(user_query):
         st.session_state.trace.append(f"➡️ {agent} activated")
 
         if agent == "XML_AGENT":
-            data = weaviate_search(sub_q, "PAAWeb")
+            data = weaviate_search(sub_q, "PAA_XML_FLIGHTS")
         elif agent == "DOC_AGENT":
             data = weaviate_search(sub_q, "PAAPolicy")
         elif agent == "WEB_AGENT":
@@ -223,7 +173,6 @@ User Query:
 
 # ================= UI =================
 st.title("✈️ PAA Enterprise Intelligence")
-
 col1, col2 = st.columns([1.2, 2])
 
 with col1:
