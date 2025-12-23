@@ -24,6 +24,7 @@ def extract_canonical_flight(query: str):
         if name in q: return iata + num
     return None
 
+
 # --- 2. CONFIG & RESOURCES ---
 st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
 client_openai = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
