@@ -39,56 +39,59 @@ def parse_xml_flights(xml_file):
     with open(xml_file, "r", encoding="utf-8", errors="ignore") as f:
         raw = clean_xml(f.read())
 
-    root = ET.fromstring(raw)
+    # 🔹 Split multiple Envelope messages safely
+    envelopes = re.findall(
+        r'(<Envelope[\s\S]*?</Envelope>)',
+        raw
+    )
 
     flights = []
 
-    for env in root.findall(".//{http://schema.ultra-as.com}Envelope"):
-        body = env.find(".//{http://schema.ultra-as.com}Body")
-        if body is None:
+    for env_xml in envelopes:
+        try:
+            root = ET.fromstring(env_xml)
+        except ET.ParseError:
+            # Skip broken / truncated envelope
             continue
 
-        flight_data = body.find(".//{http://schema.ultra-as.com}AFDSFlightData")
+        ns = {"ns": "http://schema.ultra-as.com"}
+
+        flight_data = root.find(".//ns:AFDSFlightData", ns)
         if flight_data is None:
-            continue
+            continue  # Ignore StatusRequest / StatusResponse
 
-        # Ignore junk / status-only messages
-        flight_ident = flight_data.find(".//{http://schema.ultra-as.com}FlightIdentification")
+        flight_ident = flight_data.find(".//ns:FlightIdentification", ns)
         if flight_ident is None:
             continue
 
-        flight_id = text(flight_ident, "{http://schema.ultra-as.com}FlightIdentity")
-        direction = text(flight_ident, "{http://schema.ultra-as.com}FlightDirection")
-        sched_date = text(flight_ident, "{http://schema.ultra-as.com}ScheduledDate")
+        flight_id = flight_ident.findtext("ns:FlightIdentity", default=None, namespaces=ns)
+        direction = flight_ident.findtext("ns:FlightDirection", default=None, namespaces=ns)
+        sched_date = flight_ident.findtext("ns:ScheduledDate", default=None, namespaces=ns)
 
         if not flight_id:
             continue
 
-        fd = flight_data.find(".//{http://schema.ultra-as.com}FlightData")
-        if fd is None:
-            continue
-
-        airport = fd.find(".//{http://schema.ultra-as.com}Airport")
-        flight = fd.find(".//{http://schema.ultra-as.com}Flight")
-        ops = fd.find(".//{http://schema.ultra-as.com}OperationalTimes")
+        fd = flight_data.find(".//ns:FlightData", ns)
+        airport = fd.find(".//ns:Airport", ns) if fd is not None else None
+        flight = fd.find(".//ns:Flight", ns) if fd is not None else None
+        ops = fd.find(".//ns:OperationalTimes", ns) if fd is not None else None
 
         record = {
             "flight_number": flight_id,
             "direction": direction,
             "scheduled_date": sched_date,
-            "airport": text(airport, "{http://schema.ultra-as.com}AirportIATACode") if airport is not None else None,
-            "terminal": text(airport, "{http://schema.ultra-as.com}PassengerTerminalCode") if airport is not None else None,
-            "gate": text(airport, "{http://schema.ultra-as.com}Gate/{http://schema.ultra-as.com}GateNumber") if airport is not None else None,
-            "checkin_open": text(airport, "{http://schema.ultra-as.com}Checkin/{http://schema.ultra-as.com}CheckinOpenDateTime") if airport is not None else None,
-            "checkin_close": text(airport, "{http://schema.ultra-as.com}Checkin/{http://schema.ultra-as.com}CheckinCloseDateTime") if airport is not None else None,
-            "status_code": text(flight, "{http://schema.ultra-as.com}FlightStatusCode") if flight is not None else None,
-            "scheduled_time": text(ops, "{http://schema.ultra-as.com}ScheduledDateTime") if ops is not None else None,
-            "actual_time": text(ops, "{http://schema.ultra-as.com}LatestKnownDateTime") if ops is not None else None
+            "airport": airport.findtext("ns:AirportIATACode", default=None, namespaces=ns) if airport is not None else None,
+            "terminal": airport.findtext("ns:PassengerTerminalCode", default=None, namespaces=ns) if airport is not None else None,
+            "gate": airport.findtext(".//ns:GateNumber", default=None, namespaces=ns) if airport is not None else None,
+            "status_code": flight.findtext("ns:FlightStatusCode", default=None, namespaces=ns) if flight is not None else None,
+            "scheduled_time": ops.findtext("ns:ScheduledDateTime", default=None, namespaces=ns) if ops is not None else None,
+            "actual_time": ops.findtext("ns:LatestKnownDateTime", default=None, namespaces=ns) if ops is not None else None,
         }
 
         flights.append(record)
 
     return flights
+
 
 # ================= WEAVIATE INGEST =================
 def ingest_flights(flights):
