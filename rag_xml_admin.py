@@ -72,40 +72,30 @@ def weaviate_search(query, collection):
 # --- 5. SUPERVISOR ROUTER (LLM BASED) ---
 # ================= FIXED SUPERVISOR ROUTER =================
 def supervisor_router(query):
-    # Prompt ko mazeed clear instructions di hain flight numbers k liye
-    router_prompt = f"""
-    Analyze the user query: "{query}"
-    Identify if the user is asking about:
-    
-    1. XML_AGENT: Use this for ANY flight status query, even if they ONLY provide a number (e.g., "270", "flight 270", "SV726"). 
-    2. DOC_AGENT: Baggage, liquids, pets, or airport policies.
-    3. WEB_AGENT: NOTAMs, Tenders, Complaints, Careers, or official PAA website links.
-    4. NONE: ONLY for pure greetings like "Hi", "Hello", or "How are you?". 
+    q = query.lower()
 
-    Note: If query mentions 'flight' or 'status', ALWAYS include XML_AGENT.
-    
-    Return JSON: {{"agents": ["AGENT_NAME"]}}
-    """
-    try:
-        resp = client_openai.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": "You are a strict PAA Routing Expert."},
-                {"role": "user", "content": router_prompt}
-            ]
-        )
-        res_json = json.loads(resp.choices[0].message.content)
-        agents = res_json.get("agents", ["NONE"])
-        
-        # Manual Override: Safety net for flight numbers
-        if re.search(r"\b\d{2,4}\b", query) or "flight" in query.lower():
-            if "XML_AGENT" not in agents:
-                agents = ["XML_AGENT"]
-                
-        return agents
-    except:
-        return ["NONE"]
+    # detect flight intent even without airline code
+    flight_hint = bool(
+        re.search(r"\bflight\b", q)
+        or re.search(r"\b\d{2,4}\b", q)   # like 270
+        or re.search(r"\bstatus\b", q)
+    )
+
+    baggage_hint = bool(re.search(r"\bbaggage|luggage|hand\s?carry|check[- ]?in\b", q))
+    web_hint = bool(re.search(r"website|notice|tender|official", q))
+
+    agents = []
+    if flight_hint:
+        agents.append("XML_AGENT")
+    if baggage_hint:
+        agents.append("DOC_AGENT")
+    if web_hint:
+        agents.append("WEB_AGENT")
+
+    if not agents:
+        agents = ["NONE"]
+
+    return agents
 
 # --- 6. CORE ENGINE ---
 def run_engine(user_query):
