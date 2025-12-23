@@ -72,53 +72,63 @@ def weaviate_search(query, collection):
 def supervisor_router(query):
     q = query.lower()
     
-    # 1. Check for Flight Numbers (SV727, PA200, 727, etc.)
-    # pattern: matches 2 letters + numbers OR just 3-4 digit numbers
+    # Check patterns
     has_flight_no = bool(re.search(r"\b[A-Z]{2}\s?\d{2,4}\b|\b\d{3,4}\b", q, re.I))
     
-    # 2. Check for Intent Keywords
-    baggage_words = ["baggage", "weight", "luggage", "kg", "policy", "liquid", "items", "allowance"]
-    flight_status_words = ["status", "detail", "time", "gate", "schedule", "arrival", "departure", "info"]
-    web_words = ["notam", "tender", "official", "website", "complaint", "career", "job"]
+    # Keywords
+    baggage_keywords = ["baggage", "weight", "luggage", "kg", "policy", "liquid", "items", "allowance", "carry on"]
+    status_keywords = ["status", "time", "gate", "schedule", "arrival", "departure", "landed", "where is", "detail"]
+    web_keywords = ["notam", "tender", "official", "website", "complaint", "career"]
 
-    is_baggage_query = any(word in q for word in baggage_words)
-    is_flight_query = any(word in q for word in flight_status_words)
-    is_web_query = any(word in q for word in web_words)
+    is_baggage = any(word in q for word in baggage_keywords)
+    is_status = any(word in q for word in status_keywords)
+    is_web = any(word in q for word in web_keywords)
 
     agents = []
 
-    # --- LOGIC UPDATED ---
-    # Rule 1: Agar "baggage" word hai, toh DOC_AGENT jayega
-    if is_baggage_query:
-        agents.append("DOC_AGENT")
+    # --- REFINED INTENT LOGIC ---
     
-    # Rule 2: Agar flight number hai YA "detail/status" pucha hai, toh XML_AGENT jayega
-    # (Yeh 'if' hai, 'elif' nahi—taake dono trigger ho sakein)
-    if has_flight_no or is_flight_query:
+    # Case A: If user asks for baggage (with or without flight number)
+    if is_baggage:
+        agents.append("DOC_AGENT")
+        # Only trigger XML if they specifically ask for "status" or "details" ALONG with baggage
+        if is_status:
+            agents.append("XML_AGENT")
+            
+    # Case B: Pure Flight Status query
+    elif has_flight_no or is_status:
         agents.append("XML_AGENT")
 
-    # Rule 3: Web Agent for specific PAA site queries
-    if is_web_query:
+    # Case C: Web related
+    if is_web:
         agents.append("WEB_AGENT")
 
-    # Fallback for greetings
     if not agents:
-        if re.match(r"^(hi|hello|hey|salaam|aoa)\s*$", q):
-            return ["NONE"]
-        return ["XML_AGENT"] # Default fallback
+        if re.match(r"^(hi|hello|hey|salaam|aoa)\s*$", q): return ["NONE"]
+        return ["XML_AGENT"]
 
-    # Remove duplicates if any
     return list(set(agents))
 
 # ================= QUERY DECOMPOSITION =================
 def decompose_query(query, agents):
     decomposition = {}
     for a in agents:
-        if a=="XML_AGENT": decomposition[a] = f"Status for flight: {query}"
-        elif a=="DOC_AGENT": decomposition[a] = f"Rules for: {query}"
-        elif a=="WEB_AGENT": decomposition[a] = f"Official info for: {query}"
+        if a == "XML_AGENT":
+            # Just extract the flight number for a clean DB lookup
+            flight_no = extract_canonical_flight(query)
+            decomposition[a] = flight_no if flight_no else query
+            
+        elif a == "DOC_AGENT":
+            # Remove the flight number to avoid confusing the semantic search for baggage
+            # We want to find "baggage policy" in our PDFs, not "SV727 baggage"
+            clean_q = re.sub(r"\b[A-Z]{2}\s?\d{2,4}\b|\b\d{3,4}\b", "", query, flags=re.I).strip()
+            # If after cleaning we only have "baggage policy", that's perfect for Weaviate
+            decomposition[a] = clean_q if len(clean_q) > 5 else "baggage allowance weight policy"
+            
+        elif a == "WEB_AGENT":
+            decomposition[a] = query
+            
     return decomposition
-
 # ================= COMPLETE CLEAN RUN_ENGINE =================
 def run_engine(user_query):
     st.session_state.trace.clear()
