@@ -1,0 +1,30 @@
+STATUS,DESCRIPTION
+AB,Airborne 
+AD,Advanced Flight
+BD,Boarding 
+CC,Check-in close
+CI,Check-in open
+CN,Confirmed 
+CX,Cancelled 
+DV,Diverted 
+ES,Estimated 
+EX,Expected 
+FB,First Bag 
+FS,Final Approach 
+FX,Flight Fixed 
+GA,Gate Attended 
+GC,Gate Closed 
+GO,Gate Open 
+LB,Last Bag 
+LC,Last Call 
+LD,Landed 
+NI,Next Information 
+NO,Non-operational 
+NT,New Time 
+OB,On/Off Blocks 
+OT,On Time 
+OV,Overshoot 
+RS,Return To Stand 
+SH,Scheduled 
+XF,Flight Fixed 
+ZN,Zoning 
