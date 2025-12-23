@@ -70,20 +70,44 @@ def weaviate_search(query, collection):
 
 # ================= UPDATED SUPERVISOR (LLM INTEGRATED) =================
 def supervisor_router(query):
-    # Combined Regex + Intent Logic
-    flight_hint = bool(re.search(r"\b[A-Z]{2}\d{2,4}\b|\bflight\b|\b\d{2,4}\b", query, re.I))
-    baggage_hint = bool(re.search(r"\baggage|bag|bags|luggage|weight|liquid|prohibited|items|allowance|kg|hand\s?carry|check[- ]?in\b", query, re.I))
-    web_hint = bool(re.search(r"website|notice|tender|official|notam", query, re.I))
+    # Regex for Flight Numbers
+    flight_pattern = r"\b[A-Z]{2}\d{2,4}\b|\b\d{2,4}\b"
+    has_flight_no = bool(re.search(flight_pattern, query, re.I))
+    
+    # Keywords for different intents
+    baggage_keywords = ["baggage", "weight", "luggage", "kg", "liquid", "items", "allowance", "policy"]
+    flight_keywords = ["status", "time", "gate", "delayed", "landed", "arrival", "departure", "where is"]
+    web_keywords = ["notam", "tender", "official", "website", "complaint", "career"]
+
+    is_baggage_query = any(word in query.lower() for word in baggage_keywords)
+    is_flight_query = any(word in query.lower() for word in flight_keywords)
+    is_web_query = any(word in query.lower() for word in web_keywords)
 
     agents = []
-    if flight_hint: agents.append("XML_AGENT")
-    if baggage_hint: agents.append("DOC_AGENT")
-    if web_hint: agents.append("WEB_AGENT")
+
+    # LOGIC: Agar user baggage pooch raha hai, toh DOC_AGENT lazmi jayega
+    if is_baggage_query:
+        agents.append("DOC_AGENT")
+        # Agar baggage ke sath flight number hai lekin "status" jese words nahi hain, 
+        # toh XML_AGENT ko skip kiya ja sakta hai taake noise kam ho.
+        if is_flight_query:
+            agents.append("XML_AGENT")
     
-    # Simple check for pure greetings to avoid agent activation
-    if not agents or re.match(r"^(hi|hello|hey|salaam|aoa)\s*$", query, re.I):
-        return ["NONE"]
-    return agents
+    # LOGIC: Normal flight status query
+    elif has_flight_no or is_flight_query:
+        agents.append("XML_AGENT")
+
+    if is_web_query:
+        agents.append("WEB_AGENT")
+
+    if not agents:
+        # Check for greetings
+        if re.match(r"^(hi|hello|hey|salaam|aoa)\s*$", query, re.I):
+            return ["NONE"]
+        # Default fallback to DOC or XML if something was missed but it's not a greeting
+        return ["DOC_AGENT"] if "policy" in query.lower() else ["XML_AGENT"]
+
+    return list(set(agents)) # Remove duplicates
 
 # ================= QUERY DECOMPOSITION =================
 def decompose_query(query, agents):
