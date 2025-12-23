@@ -106,14 +106,12 @@ def run_engine(user_query):
     if agents == ["NONE"]:
         answer = client_openai.chat.completions.create(
             model="gpt-4o", 
-            messages=[{"role":"system","content":"Greet professionally as PAA Assistant."},{"role":"user","content":user_query}]
+            messages=[{"role":"system","content":"Respond professionally as PAA Assistant in English only."},{"role":"user","content":user_query}]
         ).choices[0].message.content
         return answer
 
     sub_queries = decompose_query(user_query, agents)
     internal_results = []
-    
-    # Flags to help LLM understand what happened
     data_was_found = False
 
     for agent, sub_q in sub_queries.items():
@@ -126,31 +124,31 @@ def run_engine(user_query):
         else: data = []
 
         if data:
-            # Yahan hum data ko list mein append kar rahe hain
             internal_results.append({ "source_agent": agent, "content": data })
             data_was_found = True
             st.session_state.trace.append(f"✅ {agent} found data")
         else:
             st.session_state.trace.append(f"⚠️ {agent} returned NOT_FOUND")
 
-    # --- THE FIX: Updated Prompt Logic ---
+    # --- THE FIX: English Only + Bullets for Flight Data ---
     final_prompt = f"""
 You are a professional PAA (Pakistan Airports Authority) Virtual Assistant.
+RESPOND ONLY IN ENGLISH.
 
 INTERNAL DATA FOUND: {internal_results if data_was_found else "NONE"}
 
 RULES:
 1. IF 'INTERNAL DATA FOUND' is NOT "NONE":
-   - Use THIS data as your primary source. 
-   - Start your response directly with the information (e.g., "Flight SV727 ki maloomat yeh hain...").
-   - Do NOT say "records mein nahi mila".
-   - ONLY mention fields that exist in the data (e.g., if 'gate' is missing, don't mention gates at all).
+   - Use this data to provide the flight status.
+   - For flight-related queries, present the information in CLEAR BULLET POINTS.
+   - Do NOT say "internal records not found".
+   - Only include information that is present in the data (e.g., Status, Origin, Destination, Time).
 
 2. IF 'INTERNAL DATA FOUND' is "NONE":
-   - Say: "Hamare live records mein iska data mojud nahi hai, lekin aam maloomat ke mutabiq..."
-   - Then use your own knowledge to answer.
+   - Explicitly state: "The specific flight details were not found in our live database, but according to general flight information..."
+   - Then provide details from your own knowledge in English.
 
-3. General: Use Roman Urdu/English mix. No Hindi. No mention of 'Agents' or 'Databases'.
+3. General: Keep it concise, professional, and strictly in English. No Urdu or Hindi script.
 
 User Query: {user_query}
 """
@@ -159,7 +157,6 @@ User Query: {user_query}
         messages=[{"role":"system","content":final_prompt}]
     ).choices[0].message.content
     return answer
-
 # ================= UI =================
 st.title("✈️ PAA Enterprise Intelligence")
 col1,col2 = st.columns([1.2,2])
