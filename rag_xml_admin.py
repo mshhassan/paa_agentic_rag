@@ -754,15 +754,15 @@ def parse_xml_file(path):
                 "actual_time": ops.findtext("ns:LatestKnownDateTime", default=None, namespaces=ns) if ops else None,
                 "port_of_call_iata": flight.findtext("ns:PortOfCallIATACode", default=None, namespaces=ns) if flight else None,
                 "port_of_call_icao": flight.findtext("ns:PortOfCallICAOCode", default=None, namespaces=ns) if flight else None,
-                "checkin_open": flight.findtext("ns:CheckinOpenDateTime", default=None, namespaces=ns) if flight else None,
-                "checkin_close": flight.findtext("ns:CheckinCloseDateTime", default=None, namespaces=ns) if flight else None,
+                "checkin_open": flight.findtext("ns:CheckinOpenDateTime", default=None, namespaces=ns) if flight is not None else None,
+                "checkin_close": flight.findtext("ns:CheckinCloseDateTime", default=None, namespaces=ns) if flight is not None else None,
                 "checkin_desk_range": parsed_checkin,
-                "checkin_type": flight.findtext("ns:CheckinTypeCode", default=None, namespaces=ns) if flight else None,
-                "gate_open": flight.findtext("ns:GateOpenDateTime", default=None, namespaces=ns) if airport else None,
-                "gate_close": flight.findtext("ns:GateCloseDateTime", default=None, namespaces=ns) if airport else None,
-                "gate_number": airport.findtext("ns:GateNumber", default=None, namespaces=ns) if airport else None,
-                "stand_position": airport.findtext("ns:StandPosition", default=None, namespaces=ns) if airport else None,
-                "handling_agent": flight.findtext("ns:HandlingAgentIATACode", default=None, namespaces=ns) if flight else None,
+                "checkin_type": flight.findtext("ns:CheckinTypeCode", default=None, namespaces=ns) if flight is not None else None,
+                "gate_open": airport.findtext("ns:GateOpenDateTime", default=None, namespaces=ns) if airport is not None else None,
+                "gate_close": airport.findtext("ns:GateCloseDateTime", default=None, namespaces=ns) if airport is not None else None,
+                "gate_number": airport.findtext("ns:GateNumber", default=None, namespaces=ns) if airport is not None else None,
+                "stand_position": airport.findtext("ns:StandPosition", default=None, namespaces=ns) if airport is not None else None,
+                "handling_agent": flight.findtext("ns:HandlingAgentIATACode", default=None, namespaces=ns) if flight is not None else None,
             }
 
             records.append(record)
