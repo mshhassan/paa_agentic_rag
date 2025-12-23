@@ -1,25 +1,25 @@
-import streamlit as st
-import pandas as pd
+import os
+import re
+import csv
+import json
+import glob
 import xml.etree.ElementTree as ET
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.config import Property, DataType, Configure
 from sentence_transformers import SentenceTransformer
-import os
-import re
+import streamlit as st
 
 # ================= PAGE CONFIG =================
-st.set_page_config(page_title="PAA XML Flight Intelligence Agent", layout="wide")
-st.title("✈️ PAA XML Flight Intelligence Agent")
+st.set_page_config(page_title="PAA RAG Flight Admin", layout="wide")
+st.title("✈️ PAA RAG Flight Admin - CSV & XML Ingestion")
 
 # ================= CONFIG =================
-XML_PATH = "rag_xml_data/flight_snapshot.xml"
-CSV_FOLDER = "rag_xml_data"
+DATA_FOLDER = "rag_xml_data"
 WEAVIATE_URL = st.secrets["WEAVIATE_URL"]
 WEAVIATE_KEY = st.secrets["WEAVIATE_API_KEY"]
-COLLECTION_NAME = "PAAWeb"
+COLLECTION_NAME = "PAA_XML_FLIGHTS"
 
-# ================= MODEL =================
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
@@ -27,105 +27,67 @@ def load_embedder():
 EMBED = load_embedder()
 
 # ================= HELPERS =================
-def clean_xml(raw):
-    raw = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "", raw)
-    return raw.strip()
+def clean_text(raw):
+    return re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "", raw).strip()
 
-def build_dynamic_mappings(csv_folder=CSV_FOLDER):
-    """
-    Scan all CSV files and build a dict of dicts automatically.
-    Each CSV: first two columns are treated as key -> value mapping.
-    """
-    mappings = {}
-    for fname in os.listdir(csv_folder):
-        if fname.lower().endswith(".csv"):
-            fpath = os.path.join(csv_folder, fname)
-            try:
-                df = pd.read_csv(fpath)
-                cols = df.columns[:2].tolist()
-                if len(cols) < 2:
-                    continue
-                key_col, value_col = cols
-                map_name = os.path.splitext(fname)[0]  # filename without extension
-                mappings[map_name] = dict(zip(df[key_col].astype(str), df[value_col].astype(str)))
-            except Exception as e:
-                st.warning(f"⚠️ Could not process {fname}: {e}")
-    return mappings
+def parse_csv_file(path):
+    records = []
+    with open(path, newline="", encoding="utf-8", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Normalize keys and remove empty columns
+            clean_row = {k.strip(): v.strip() for k, v in row.items() if v.strip()}
+            if clean_row:
+                records.append(clean_row)
+    return records
 
-# ================= XML PARSER =================
-def parse_xml_flights(xml_file, mappings):
-    with open(xml_file, "r", encoding="utf-8", errors="ignore") as f:
-        raw = clean_xml(f.read())
-
-    envelopes = re.findall(r'(<Envelope[\s\S]*?</Envelope>)', raw)
-    flights = []
-
-    for env_xml in envelopes:
-        try:
-            root = ET.fromstring(env_xml)
-        except ET.ParseError:
-            continue
-
+def parse_xml_file(path):
+    records = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        raw = clean_text(f.read())
+        envelopes = re.findall(r'(<Envelope[\s\S]*?</Envelope>)', raw)
         ns = {"ns": "http://schema.ultra-as.com"}
-        flight_data = root.find(".//ns:AFDSFlightData", ns)
-        if flight_data is None:
-            continue
 
-        flight_ident = flight_data.find(".//ns:FlightIdentification", ns)
-        if flight_ident is None:
-            continue
+        for env_xml in envelopes:
+            try:
+                root = ET.fromstring(env_xml)
+            except ET.ParseError:
+                continue
+            flight_data = root.find(".//ns:AFDSFlightData", ns)
+            if not flight_data:
+                continue
+            flight_ident = flight_data.find(".//ns:FlightIdentification", ns)
+            if not flight_ident:
+                continue
+            flight_id = flight_ident.findtext("ns:FlightIdentity", default=None, namespaces=ns)
+            direction = flight_ident.findtext("ns:FlightDirection", default=None, namespaces=ns)
+            sched_date = flight_ident.findtext("ns:ScheduledDate", default=None, namespaces=ns)
+            fd = flight_data.find(".//ns:FlightData", ns)
+            airport = fd.find(".//ns:Airport", ns) if fd is not None else None
+            flight = fd.find(".//ns:Flight", ns) if fd is not None else None
+            ops = fd.find(".//ns:OperationalTimes", ns) if fd is not None else None
 
-        flight_id = flight_ident.findtext("ns:FlightIdentity", default=None, namespaces=ns)
-        direction = flight_ident.findtext("ns:FlightDirection", default=None, namespaces=ns)
+            record = {
+                "flight_number": flight_id,
+                "direction": direction,
+                "scheduled_date": sched_date,
+                "airport": airport.findtext("ns:AirportIATACode", default=None, namespaces=ns) if airport else None,
+                "terminal": airport.findtext("ns:PassengerTerminalCode", default=None, namespaces=ns) if airport else None,
+                "gate": airport.findtext(".//ns:GateNumber", default=None, namespaces=ns) if airport else None,
+                "status_code": flight.findtext("ns:FlightStatusCode", default=None, namespaces=ns) if flight else None,
+                "scheduled_time": ops.findtext("ns:ScheduledDateTime", default=None, namespaces=ns) if ops else None,
+                "actual_time": ops.findtext("ns:LatestKnownDateTime", default=None, namespaces=ns) if ops else None,
+            }
+            records.append(record)
+    return records
 
-        fd = flight_data.find(".//ns:FlightData", ns)
-        airport_el = fd.find(".//ns:Airport", ns) if fd is not None else None
-        flight_el = fd.find(".//ns:Flight", ns) if fd is not None else None
-        ops_el = fd.find(".//ns:OperationalTimes", ns) if fd is not None else None
-
-        if not flight_id:
-            continue
-
-        # --- Use dynamic mappings ---
-        airline_map = mappings.get("airlines", {})
-        airport_map = mappings.get("airports", {})
-        status_map = mappings.get("status_codes", {})
-        aircraft_map = mappings.get("aircraft_types", {})
-
-        carrier_code = flight_el.findtext("ns:CarrierIATACode", default=None, namespaces=ns) if flight_el is not None else None
-        flight_status_code = flight_el.findtext("ns:FlightStatusCode", default=None, namespaces=ns) if flight_el is not None else None
-        airport_code = airport_el.findtext("ns:AirportIATACode", default=None, namespaces=ns) if airport_el is not None else None
-        terminal = airport_el.findtext("ns:PassengerTerminalCode", default=None, namespaces=ns) if airport_el is not None else None
-        gate = airport_el.findtext("ns:GateNumber", default=None, namespaces=ns) if airport_el is not None else None
-        aircraft_code = flight_el.findtext("ns:AircraftSubtypeIATACode", default=None, namespaces=ns) if flight_el is not None else None
-
-        sched_time = ops_el.findtext("ns:ScheduledDateTime", default=None, namespaces=ns) if ops_el is not None else None
-        actual_time = ops_el.findtext("ns:LatestKnownDateTime", default=None, namespaces=ns) if ops_el is not None else None
-
-        record = {
-            "flight_number": flight_id,
-            "direction": direction,
-            "airport": airport_map.get(airport_code, airport_code),
-            "terminal": terminal,
-            "gate": gate,
-            "status_code": status_map.get(flight_status_code, flight_status_code),
-            "airline": airline_map.get(carrier_code, carrier_code),
-            "aircraft": aircraft_map.get(aircraft_code, aircraft_code),
-            "scheduled_time": sched_time,
-            "actual_time": actual_time,
-        }
-
-        flights.append(record)
-
-    return flights
-
-# ================= WEAVIATE INGEST =================
-def ingest_flights(flights):
+def ingest_to_weaviate(records):
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=WEAVIATE_URL,
         auth_credentials=Auth.api_key(WEAVIATE_KEY)
     )
 
+    # Delete if exists
     if client.collections.exists(COLLECTION_NAME):
         client.collections.delete(COLLECTION_NAME)
 
@@ -139,47 +101,53 @@ def ingest_flights(flights):
             Property(name="terminal", data_type=DataType.TEXT),
             Property(name="gate", data_type=DataType.TEXT),
             Property(name="status_code", data_type=DataType.TEXT),
-            Property(name="airline", data_type=DataType.TEXT),
-            Property(name="aircraft", data_type=DataType.TEXT),
             Property(name="summary", data_type=DataType.TEXT),
         ]
     )
 
     with coll.batch.dynamic() as batch:
-        for f in flights:
+        for f in records:
             summary = (
-                f"Flight {f['flight_number']} ({f['airline']}) is a {f['direction']} flight at airport {f['airport']}. "
-                f"Terminal {f['terminal']}, Gate {f['gate']}. "
-                f"Aircraft: {f['aircraft']}, Status: {f['status_code']}. "
-                f"Scheduled {f['scheduled_time']}, Latest {f['actual_time']}."
+                f"Flight {f.get('flight_number')} is a {f.get('direction')} flight at airport {f.get('airport')}. "
+                f"Terminal {f.get('terminal')}, Gate {f.get('gate')}. "
+                f"Status code {f.get('status_code')}. "
+                f"Scheduled {f.get('scheduled_time')}, Latest {f.get('actual_time')}."
             )
-
             batch.add_object(
                 properties={
-                    **f,
+                    "flight_number": f.get("flight_number"),
+                    "direction": f.get("direction"),
+                    "airport": f.get("airport"),
+                    "terminal": f.get("terminal"),
+                    "gate": f.get("gate"),
+                    "status_code": f.get("status_code"),
                     "summary": summary
                 },
                 vector=EMBED.encode(summary).tolist()
             )
-
     client.close()
 
 # ================= UI =================
-st.markdown("### 📄 XML Source")
-st.code(XML_PATH)
+st.markdown(f"### 📂 Scanning folder: {DATA_FOLDER}")
+files = glob.glob(os.path.join(DATA_FOLDER, "*.*"))
 
-if not os.path.exists(XML_PATH):
-    st.error("❌ flight_snapshot.xml not found.")
+if not files:
+    st.error("No CSV or XML files found in the data folder.")
     st.stop()
 
-if st.button("🏗️ Parse XML & Update Flight Index"):
-    with st.spinner("Processing XML and updating flight intelligence index..."):
-        mappings = build_dynamic_mappings(CSV_FOLDER)
-        flights = parse_xml_flights(XML_PATH, mappings)
+st.write(files)
 
-        if not flights:
-            st.warning("No valid flight records found.")
-        else:
-            ingest_flights(flights)
-            st.success(f"✅ Indexed {} flight records successfully!".format(len(flights)))
-            st.balloons()
+if st.button("🏗️ Parse & Index All Files"):
+    all_records = []
+    for f in files:
+        if f.lower().endswith(".csv"):
+            all_records.extend(parse_csv_file(f))
+        elif f.lower().endswith(".xml"):
+            all_records.extend(parse_xml_file(f))
+
+    if all_records:
+        ingest_to_weaviate(all_records)
+        st.success(f"✅ Indexed {len(all_records)} flight records successfully!")
+        st.balloons()
+    else:
+        st.warning("No valid flight records found.")
