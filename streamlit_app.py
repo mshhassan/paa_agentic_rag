@@ -72,7 +72,7 @@ def weaviate_search(query, collection):
 def supervisor_router(query):
     # Combined Regex + Intent Logic
     flight_hint = bool(re.search(r"\b[A-Z]{2}\d{2,4}\b|\bflight\b|\b\d{2,4}\b", query, re.I))
-    baggage_hint = bool(re.search(r"\bbaggage|luggage|hand\s?carry|check[- ]?in\b", query, re.I))
+    baggage_hint = bool(re.search(r"\baggage|bag|bags|luggage|weight|liquid|prohibited|items|allowance|kg|hand\s?carry|check[- ]?in\b", query, re.I))
     web_hint = bool(re.search(r"website|notice|tender|official|notam", query, re.I))
 
     agents = []
@@ -141,7 +141,7 @@ def run_engine(user_query):
         else:
             st.session_state.trace.append(f"⚠️ {agent} returned NOT_FOUND")
 
-    # 4. Final Reasoning and Response Construction
+    # 4. Final Reasoning and Response Construction (UPDATED LOGIC)
     final_prompt = f"""
 You are a professional PAA (Pakistan Airports Authority) Virtual Assistant.
 RESPOND ONLY IN ENGLISH.
@@ -149,12 +149,16 @@ RESPOND ONLY IN ENGLISH.
 INTERNAL DATABASE CONTEXT: {internal_results if data_was_found else "NONE"}
 
 STRICT RESPONSE RULES:
-1. SPECIFICITY: If the user asks for a specific detail (like 'gate', 'time', or 'status'), provide ONLY that information. Do not provide a full summary unless requested.
+1. SPECIFICITY: 
+   - If user asks about FLIGHT STATUS (XML_AGENT): Provide details in professional bullet points.
+   - If user asks about BAGGAGE/POLICIES (DOC_AGENT): Summarize the rules clearly in bullets.
+   - If a specific detail (like 'gate' or 'liquid limit') is asked, provide ONLY that.
+
 2. DATA INTEGRITY: Only mention fields that have actual, valid values in the context. 
-3. HIDE EMPTY FIELDS: If a field is missing, null, or says 'Not Specified', DO NOT mention it.
-4. FALLBACK: If 'INTERNAL DATABASE CONTEXT' is NONE, say: "The specific details were not found in our live database. However, based on general knowledge..." and then answer using your internal knowledge.
-5. NO DISCLAIMER ON SUCCESS: If data is found, do NOT say "Internal records not found".
-6. FORMATTING: Use professional bullet points for flight details. Avoid Urdu/Hindi scripts.
+3. HIDE EMPTY FIELDS: If a field is missing, null, or says 'Not Specified' in the database, DO NOT mention it.
+4. FALLBACK: If 'INTERNAL DATABASE CONTEXT' is NONE, say: "The specific details were not found in our records. However, based on general knowledge..." and answer in English.
+5. NO DISCLAIMER ON SUCCESS: If data is found from any agent, do NOT say "Internal records not found".
+6. FORMATTING: Use clean bullet points. Strictly no Urdu/Hindi script.
 
 User Query: {user_query}
 """
@@ -172,7 +176,6 @@ User Query: {user_query}
         st.session_state.trace.append(f"❌ LLM Error: {e}")
 
     return answer
-    
 # ================= UI =================
 st.title("✈️ PAA Enterprise Intelligence")
 col1,col2 = st.columns([1.2,2])
