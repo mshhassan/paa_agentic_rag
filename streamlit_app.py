@@ -43,31 +43,40 @@ if "agent_status" not in st.session_state:
     st.session_state.agent_status = {"XML_AGENT": False, "DOC_AGENT": False, "WEB_AGENT": False}
 
 # ================= WEAVIATE SEARCH =================
-def decompose_query(query, agents):
-    decomposition = {}
-    for a in agents:
-        if a == "XML_AGENT":
-            flight_no = extract_canonical_flight(query)
-            decomposition[a] = flight_no if flight_no else query
-            
-        elif a == "DOC_AGENT":
-            # Sirf flight number remove nahi karna, balki Airline identify karni hai
-            flight_no = extract_canonical_flight(query)
-            clean_q = re.sub(r"\b[A-Z]{2}\s?\d{2,4}\b|\b\d{3,4}\b", "", query, flags=re.I).strip()
-            
-            airline_context = ""
-            if flight_no:
-                prefix = flight_no[:2].upper()
-                # Reverse mapping taake SV se 'Saudia' mil jaye
-                INV_ALIASES = {v: k for k, v in AIRLINE_ALIASES.items()}
-                airline_name = INV_ALIASES.get(prefix, "")
-                airline_context = f"{airline_name} baggage policy"
-            
-            # Agar airline mili toh wo use karein, warna original clean query
-            decomposition[a] = airline_context if airline_context else clean_q
-            
-    return decomposition
+def weaviate_search(query, collection):
+    try:
+        client = weaviate.connect_to_weaviate_cloud(
+            cluster_url=st.secrets["WEAVIATE_URL"],
+            auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
+        )
+        coll = client.collections.get(collection)
+        
+        # 1. Flight Status ke liye (XML_AGENT)
+        flight_no = extract_canonical_flight(query)
+        if flight_no and collection == "PAA_XML_FLIGHTS":
+            exact = coll.query.fetch_objects(
+                filters=weaviate.classes.query.Filter.by_property("flight_number").equal(flight_no),
+                limit=1
+            )
+            if exact.objects:
+                client.close()
+                return [o.properties for o in exact.objects]
 
+        # 2. Baggage/Policy ke liye (DOC_AGENT)
+        # return_metadata zaroori hai taake pata chale match kitna strong hai
+        semantic = coll.query.near_vector(
+            near_vector=EMBED.encode(query).tolist(), 
+            limit=3,
+            return_metadata=weaviate.classes.query.MetadataQuery(distance=True)
+        )
+        client.close()
+
+        # 0.45 ko 0.55 ya 0.6 kar dein temporary testing ke liye
+        results = [o.properties for o in semantic.objects if o.metadata.distance <= 0.6]
+        return results
+    except Exception as e:
+        st.warning(f"Weaviate search failed: {e}")
+        return []
 # ================= UPDATED SUPERVISOR (LLM INTEGRATED) =================
 def supervisor_router(query):
     q = query.lower()
@@ -114,19 +123,24 @@ def decompose_query(query, agents):
     decomposition = {}
     for a in agents:
         if a == "XML_AGENT":
-            # Just extract the flight number for a clean DB lookup
             flight_no = extract_canonical_flight(query)
             decomposition[a] = flight_no if flight_no else query
             
         elif a == "DOC_AGENT":
-            # Remove the flight number to avoid confusing the semantic search for baggage
-            # We want to find "baggage policy" in our PDFs, not "SV727 baggage"
+            # Sirf flight number remove nahi karna, balki Airline identify karni hai
+            flight_no = extract_canonical_flight(query)
             clean_q = re.sub(r"\b[A-Z]{2}\s?\d{2,4}\b|\b\d{3,4}\b", "", query, flags=re.I).strip()
-            # If after cleaning we only have "baggage policy", that's perfect for Weaviate
-            decomposition[a] = clean_q if len(clean_q) > 5 else "baggage allowance weight policy"
             
-        elif a == "WEB_AGENT":
-            decomposition[a] = query
+            airline_context = ""
+            if flight_no:
+                prefix = flight_no[:2].upper()
+                # Reverse mapping taake SV se 'Saudia' mil jaye
+                INV_ALIASES = {v: k for k, v in AIRLINE_ALIASES.items()}
+                airline_name = INV_ALIASES.get(prefix, "")
+                airline_context = f"{airline_name} baggage policy"
+            
+            # Agar airline mili toh wo use karein, warna original clean query
+            decomposition[a] = airline_context if airline_context else clean_q
             
     return decomposition
 # ================= COMPLETE CLEAN RUN_ENGINE =================
