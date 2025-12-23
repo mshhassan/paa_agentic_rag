@@ -6,44 +6,46 @@ from sentence_transformers import SentenceTransformer
 import re
 import json
 
+# --- Flight number normalization ---
 AIRLINE_ALIASES = {
     "AIRBLUE": "PA",
     "AIR BLUE": "PA",
-    "PA": "PA",
-    "PIA": "PK",
-    "PAKISTAN INTERNATIONAL": "PK",
     "PAKISTAN INTERNATIONAL AIRLINE": "PK",
-    "PK": "PK",
-    "SERENE": "ER",
+    "PAKISTAN INTERNATIONAL": "PK",
     "SERENE AIR": "ER",
+    "SERENE": "ER",
     "AIR SIAL": "PF",
-    "PF": "PF",
-    "TURKISH": "TK",
+    "AIR SIAL AIRWAYS": "PF",
     "TURKISH AIRLINES": "TK",
+    "TURKISH": "TK",
+    "PIA": "PK",
+    "PK": "PK",
+    "PA": "PA",
+    "PF": "PF",
     "TK": "TK",
 }
 
 def extract_canonical_flight(query: str):
-    q = query.upper().replace("-", " ")
+    q = query.upper().replace("-", " ").replace(".", " ")
     q = re.sub(r"\s+", " ", q)
-
-    # PA270 / PK287
+    
+    # Direct flight code like PA270
     m = re.search(r"\b([A-Z]{2})\s*(\d{2,4})\b", q)
     if m:
         return m.group(1) + m.group(2)
 
-    # 270 PA / 270 AIRBLUE
-    m = re.search(r"\b(\d{2,4})\b", q)
-    if not m:
+    # Now find flight number part
+    m2 = re.search(r"\b(\d{2,4})\b", q)
+    if not m2:
         return None
+    num = m2.group(1)
 
-    number = m.group(1)
-
+    # Try airline alias
     for name, iata in AIRLINE_ALIASES.items():
         if name in q:
-            return iata + number
+            return iata + num
 
-    return None
+    return NoneNone
 
 
 # ================= CONFIG =================
@@ -73,40 +75,33 @@ def weaviate_search(query, collection):
             cluster_url=st.secrets["WEAVIATE_URL"],
             auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
         )
-
         coll = client.collections.get(collection)
 
-        canonical_flight = extract_canonical_flight(query)
-
-        # 1️⃣ Exact flight match
-        if canonical_flight:
+        # Try canonical flight number first
+        flight_no = extract_canonical_flight(query)
+        if flight_no:
             exact = coll.query.fetch_objects(
-                filters={
-                    "path": ["flight_number"],
-                    "operator": "Equal",
-                    "valueText": canonical_flight
-                },
+                filters={"path": ["flight_number"], "operator": "Equal", "valueText": flight_no},
                 limit=1
             )
             if exact.objects:
                 client.close()
                 return [o.properties for o in exact.objects]
 
-        # 2️⃣ Semantic fallback
+        # Fallback semantic
         semantic = coll.query.near_vector(
             near_vector=EMBED.encode(query).tolist(),
             limit=3
         )
-
         client.close()
         if semantic.objects:
             return [o.properties for o in semantic.objects]
-
         return []
 
     except Exception as e:
         st.warning(f"Weaviate search failed: {e}")
         return []
+
 
 # ================= SUPERVISOR =================
 def supervisor_router(query):
@@ -177,7 +172,6 @@ Rules:
 - If an agent returned NOT_FOUND, acknowledge professionally.
 - Use external knowledge ONLY for missing parts.
 - Do not mention agents, RAG, or databases.
-- Respond clearly in English.
 
 User Query:
 {user_query}
