@@ -177,6 +177,7 @@ Rules:
 - If an agent returned NOT_FOUND, acknowledge professionally.
 - Use external knowledge ONLY for missing parts.
 - Do not mention agents, RAG, or databases.
+- Respond clearly in English.
 
 User Query:
 {user_query}
