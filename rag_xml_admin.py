@@ -70,25 +70,39 @@ def weaviate_search(query, collection):
         return []
 
 # --- 5. SUPERVISOR ROUTER (LLM BASED) ---
+# ================= FIXED SUPERVISOR ROUTER =================
 def supervisor_router(query):
-    # Intent detection to avoid agents for 'Hi/Hello'
+    # Prompt ko mazeed clear instructions di hain flight numbers k liye
     router_prompt = f"""
     Analyze the user query: "{query}"
-    Route to specific agents ONLY if PAA domain specific.
-    - XML_AGENT: Flight status, schedule, arrivals, departures, gates, check-in info.
-    - DOC_AGENT: Baggage weight limits, prohibited items, pets, carry-on rules.
-    - WEB_AGENT: NOTAMs, Tenders, Complaints, Careers, Feedback, PAA links.
-    - NONE: General greetings (hi, hello) or non-PAA topics.
+    Identify if the user is asking about:
+    
+    1. XML_AGENT: Use this for ANY flight status query, even if they ONLY provide a number (e.g., "270", "flight 270", "SV726"). 
+    2. DOC_AGENT: Baggage, liquids, pets, or airport policies.
+    3. WEB_AGENT: NOTAMs, Tenders, Complaints, Careers, or official PAA website links.
+    4. NONE: ONLY for pure greetings like "Hi", "Hello", or "How are you?". 
 
+    Note: If query mentions 'flight' or 'status', ALWAYS include XML_AGENT.
+    
     Return JSON: {{"agents": ["AGENT_NAME"]}}
     """
     try:
         resp = client_openai.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": "You are a PAA Router Agent."}, {"role": "user", "content": router_prompt}]
+            messages=[
+                {"role": "system", "content": "You are a strict PAA Routing Expert."},
+                {"role": "user", "content": router_prompt}
+            ]
         )
-        agents = json.loads(resp.choices[0].message.content).get("agents", ["NONE"])
+        res_json = json.loads(resp.choices[0].message.content)
+        agents = res_json.get("agents", ["NONE"])
+        
+        # Manual Override: Safety net for flight numbers
+        if re.search(r"\b\d{2,4}\b", query) or "flight" in query.lower():
+            if "XML_AGENT" not in agents:
+                agents = ["XML_AGENT"]
+                
         return agents
     except:
         return ["NONE"]
