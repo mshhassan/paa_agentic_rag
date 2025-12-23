@@ -95,14 +95,6 @@ def decompose_query(query, agents):
     return decomposition
 
 # ================= MAIN ENGINE =================
-Bhai, bilkul point ki baat ki hai aapne. Agar gate ka data null ya khali hai, toh uska zikr hi nahi hona chahiye response mein. "Not Specified" ya "N/A" likhne se professional look kharab hota hai.
-
-Maine prompt ko mazeed "Strict" kar diya hai: "If a field is empty or missing in the data, DO NOT mention it at all."
-
-Aap apna run_engine function is final version se replace kar lein:
-
-Python
-
 # ================= FINAL CLEANED MAIN ENGINE =================
 def run_engine(user_query):
     st.session_state.trace.clear()
