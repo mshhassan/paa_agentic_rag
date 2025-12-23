@@ -11,7 +11,7 @@ from sentence_transformers import SentenceTransformer
 import streamlit as st
 
 # ================= PAGE CONFIG =================
-st.set_page_config(page_title="PAA XML Flight Data RAG Admin", layout="wide", page_icon="✈️")
+st.set_page_config(page_title="PAA XML RAG Admin", layout="wide", page_icon="✈️")
 st.title("✈️ PAA RAG Flight Admin - CSV & XML Ingestion")
 
 # ================= CONFIG =================
