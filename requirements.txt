@@ -8,10 +8,4 @@ lxml
 requests
 beautifulsoup4
 pandas
-streamlit
-openai
-weaviate-client
-sentence-transformers
 torch --index-url https://download.pytorch.org/whl/cpu
-pandas
-lxml
