@@ -50,9 +50,10 @@ def weaviate_search(query, collection):
             auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
         )
         coll = client.collections.get(collection)
+        
+        # 1. Flight Status ke liye (XML_AGENT)
         flight_no = extract_canonical_flight(query)
         if flight_no and collection == "PAA_XML_FLIGHTS":
-            # Correct Filter Syntax for Weaviate v4
             exact = coll.query.fetch_objects(
                 filters=weaviate.classes.query.Filter.by_property("flight_number").equal(flight_no),
                 limit=1
@@ -60,10 +61,19 @@ def weaviate_search(query, collection):
             if exact.objects:
                 client.close()
                 return [o.properties for o in exact.objects]
-        
-        semantic = coll.query.near_vector(near_vector=EMBED.encode(query).tolist(), limit=3)
+
+        # 2. Baggage/Policy ke liye (DOC_AGENT)
+        # return_metadata zaroori hai taake pata chale match kitna strong hai
+        semantic = coll.query.near_vector(
+            near_vector=EMBED.encode(query).tolist(), 
+            limit=3,
+            return_metadata=weaviate.classes.query.MetadataQuery(distance=True)
+        )
         client.close()
-        return [o.properties for o in semantic.objects] if semantic.objects else []
+
+        # Sirf wahi results jo waqai relevant hon (distance <= 0.45)
+        results = [o.properties for o in semantic.objects if o.metadata.distance <= 0.45]
+        return results
     except Exception as e:
         st.warning(f"Weaviate search failed: {e}")
         return []
