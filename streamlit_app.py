@@ -4,11 +4,12 @@ import weaviate
 from weaviate.classes.init import Auth
 from sentence_transformers import SentenceTransformer
 import json
+import re
 
 # --- 1. CONFIG & INITIALIZATION ---
 st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
 
-# Custom CSS for UI Matching (Black Trace Console & Dots)
+# Custom CSS for UI Matching
 st.markdown("""
     <style>
     .trace-box {
@@ -68,14 +69,30 @@ def run_paa_engine(query):
     st.session_state.agent_status = {"XML": False, "Web": False, "Docs": False}
     st.session_state.trace.append(f"> 📥 Query Received: {query}")
     
-    # Routing Logic
-    analysis_prompt = f"Analyze: '{query}'. Scores (0-1): XML, Web, Docs. Return JSON format."
+    # 3a. AI Routing Decision with Strict Rules
+    analysis_prompt = f"""
+    Analyze query: "{query}"
+    RULES:
+    1. If query contains a flight number (like SV726, PK300, etc.), XML MUST be 1.0.
+    2. If query is about baggage/rules, Docs MUST be 1.0.
+    3. If query asks for links/websites, Web MUST be 1.0.
+    Return JSON format: {{"XML": score, "Web": score, "Docs": score}}
+    """
+    
     try:
         resp = client_openai.chat.completions.create(
-            model="gpt-4o-mini", response_format={"type":"json_object"}, 
-            messages=[{"role":"system", "content":"You are a PAA Supervisor."}, {"role":"user","content":analysis_prompt}]
+            model="gpt-4o-mini", 
+            response_format={"type":"json_object"}, 
+            messages=[{"role":"system", "content":"You are a PAA Supervisor Expert."}, {"role":"user","content":analysis_prompt}]
         )
         scores = json.loads(resp.choices[0].message.content)
+
+        # 3b. REGEX OVERRIDE (Forcing XML if flight number is detected)
+        if re.search(r'[a-zA-Z]{2}\d{2,4}', query):
+            scores["XML"] = 1.0
+            scores["Web"] = 0.0
+            st.session_state.trace.append("> 🛠️ Regex Detected: Flight Number Pattern Found.")
+
         st.session_state.trace.append(f"> 🤖 Routing Scores: {scores}")
 
         context_data = ""
@@ -90,27 +107,17 @@ def run_paa_engine(query):
                 if retrieved and len(retrieved.strip()) > 0:
                     context_data += f"\n[{key} Official Data]: {retrieved}"
                 else:
-                    st.session_state.trace.append(f"> ⚠️ {key} Agent returned NO data from DB.")
+                    st.session_state.trace.append(f"> ⚠️ {key} Agent: No data in DB for '{query}'")
 
-        # --- SMART LLM RESPONSE LOGIC ---
+        # 3c. RESPONSE GENERATION (Official vs LLM Knowledge)
         if context_data.strip():
-            # Agar data mil gaya toh official response
-            system_message = f"""
-            You are the PAA Official Assistant. 
-            Answer using the Official Context provided below.
-            
-            OFFICIAL CONTEXT:
-            {context_data}
-            """
+            system_message = f"You are the PAA Official Assistant. Answer using this Context: {context_data}"
         else:
-            # Agar DB khali hai toh LLM knowledge with Disclaimer
             st.session_state.trace.append("> ℹ️ No DB records found. Switching to LLM Knowledge.")
             system_message = f"""
             You are the PAA Official Assistant. 
-            CRITICAL INSTRUCTION: No data was found in the PAA AODB/Database for this query.
-            1. You MUST start your response with this EXACT disclaimer: 
-               "⚠️ *Disclaimer: Yeh maloomat general internet records se li gayi hain, PAA ke official AODB database mein filhal iska record maujood nahi hai.*"
-            2. After the disclaimer, provide the best possible answer using your general knowledge.
+            Start with: "⚠️ *Disclaimer: Yeh maloomat general internet records se li gayi hain, PAA ke official AODB database mein filhal iska record maujood nahi hai.*"
+            Then provide the best answer using your general knowledge for "{query}".
             """
 
         ans_resp = client_openai.chat.completions.create(
@@ -129,26 +136,21 @@ def run_paa_engine(query):
 # --- 4. THREE-COLUMN LAYOUT ---
 col1, col2, col3 = st.columns([1.2, 1.5, 2], gap="medium")
 
-# COLUMN 1: Trace Console (Black)
+# COLUMN 1: Trace Console
 with col1:
     st.markdown("### 📁 Trace Console")
     if st.button("Clear All"):
         st.session_state.messages, st.session_state.trace = [], []
         st.rerun()
-    
     trace_content = "".join([f"<div style='margin-bottom:5px;'>{t}</div>" for t in st.session_state.trace])
     st.markdown(f"<div class='trace-box'>{trace_content}</div>", unsafe_allow_html=True)
 
-# COLUMN 2: Agentic Flow Visualization (Dots)
+# COLUMN 2: Agentic Flow Visualization
 with col2:
     st.markdown("### 🛠️ Agentic Flow Visualization")
-    st.write("")
-    # Supervisor
-    st.markdown("<center><div class='agent-dot dot-supervisor'></div><br><b>Supervisor Agent</b><br>↓</center>", unsafe_allow_html=True)
-    
+    st.markdown("<center><br><div class='agent-dot dot-supervisor'></div><br><b>Supervisor Agent</b><br>↓</center>", unsafe_allow_html=True)
     v_col1, v_col2, v_col3 = st.columns(3)
     agents = [("XML", v_col1), ("Web", v_col2), ("Docs", v_col3)]
-    
     for name, col in agents:
         status_class = "dot-active" if st.session_state.agent_status[name] else "dot-inactive"
         with col:
@@ -161,7 +163,6 @@ with col3:
     with chat_container:
         for m in st.session_state.messages:
             with st.chat_message(m["role"]): st.markdown(m["content"])
-
     if prompt := st.chat_input("Ask about flights, web links, or documents..."):
         run_paa_engine(prompt)
         st.rerun()
