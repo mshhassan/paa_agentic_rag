@@ -94,28 +94,8 @@ def decompose_query(query, agents):
         elif a=="WEB_AGENT": decomposition[a] = f"Official info for: {query}"
     return decomposition
 
-# ================= MAIN ENGINE =================
-# ================= FINAL CLEANED MAIN ENGINE =================
+# ================= COMPLETE CLEAN RUN_ENGINE =================
 def run_engine(user_query):
-    st.session_state.trace.clear()
-    st.session_state.agent_status = {k:False for k in st.session_state.agent_status}
-    st.session_state.trace.append(f"📥 User Query: {user_query}")
-
-    agents = supervisor_router(user_query)
-    st.session_state.trace.append(f"🧠 Supervisor Routing: {agents}")
-
-    if agents == ["NONE"]:
-        answer = client_openai.chat.completions.create(
-            model="gpt-4o", 
-            messages=[{"role":"system","content":"Respond professionally as PAA Assistant in English only."},{"role":"user","content":user_query}]
-        ).choices[0].message.content
-        return answer
-
-    sub_queries = decompose_query(user_query, agents)
-    internal_results = []
-    data_was_found = False
-
-    for agdef run_engine(user_query):
     st.session_state.trace.clear()
     # Resetting agent status for the new query
     st.session_state.agent_status = {k: False for k in st.session_state.agent_status}
@@ -127,14 +107,14 @@ def run_engine(user_query):
 
     # 2. Handle simple greetings or off-topic queries
     if agents == ["NONE"]:
-        answer = client_openai.chat.completions.create(
+        response = client_openai.chat.completions.create(
             model="gpt-4o", 
             messages=[
                 {"role": "system", "content": "Respond professionally as a PAA Virtual Assistant in English only. Keep it brief."},
                 {"role": "user", "content": user_query}
             ]
-        ).choices[0].message.content
-        return answer
+        )
+        return response.choices[0].message.content
 
     # 3. Decompose query and fetch data from agents
     sub_queries = decompose_query(user_query, agents)
@@ -170,8 +150,8 @@ INTERNAL DATABASE CONTEXT: {internal_results if data_was_found else "NONE"}
 
 STRICT RESPONSE RULES:
 1. SPECIFICITY: If the user asks for a specific detail (like 'gate', 'time', or 'status'), provide ONLY that information. Do not provide a full summary unless requested.
-2. DATA INTEGRITY: Only mention fields that have actual, valid values in the 'INTERNAL DATABASE CONTEXT'. 
-3. HIDE EMPTY FIELDS: If a field is missing, null, or says 'Not Specified' in the database, DO NOT mention it.
+2. DATA INTEGRITY: Only mention fields that have actual, valid values in the context. 
+3. HIDE EMPTY FIELDS: If a field is missing, null, or says 'Not Specified', DO NOT mention it.
 4. FALLBACK: If 'INTERNAL DATABASE CONTEXT' is NONE, say: "The specific details were not found in our live database. However, based on general knowledge..." and then answer using your internal knowledge.
 5. NO DISCLAIMER ON SUCCESS: If data is found, do NOT say "Internal records not found".
 6. FORMATTING: Use professional bullet points for flight details. Avoid Urdu/Hindi scripts.
@@ -184,11 +164,11 @@ User Query: {user_query}
         response = client_openai.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "system", "content": final_prompt}, {"role": "user", "content": user_query}],
-            temperature=0.1 # Keeping it precise
+            temperature=0.1
         )
         answer = response.choices[0].message.content
     except Exception as e:
-        answer = f"I apologize, but I encountered an error processing your request: {e}"
+        answer = f"I apologize, but I encountered an error: {e}"
         st.session_state.trace.append(f"❌ LLM Error: {e}")
 
     return answer
