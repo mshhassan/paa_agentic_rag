@@ -6,12 +6,51 @@ from sentence_transformers import SentenceTransformer
 import re
 import json
 
-# --- Flight number normalization ---
+# --- Flight number normalization --- Updated Comprehensive Airline Aliases for Pakistan Operations ---
 AIRLINE_ALIASES = {
-    "AIRBLUE": "PA", "AIR BLUE": "PA", "PAKISTAN INTERNATIONAL AIRLINE": "PK",
-    "PAKISTAN INTERNATIONAL": "PK", "SERENE AIR": "ER", "SERENE": "ER",
-    "AIR SIAL": "PF", "AIR SIAL AIRWAYS": "PF", "TURKISH AIRLINES": "TK",
-    "TURKISH": "TK", "PIA": "PK", "PK": "PK", "PA": "PA", "PF": "PF", "TK": "TK",
+    # Domestic & Major Local
+    "PIA": "PK", "PAKISTAN INTERNATIONAL": "PK", "PAKISTAN INTERNATIONAL AIRLINE": "PK",
+    "AIRBLUE": "PA", "AIR BLUE": "PA",
+    "AIR SIAL": "PF", "AIRSIAL": "PF", "AIR SIAL AIRWAYS": "PF",
+    "SERENE AIR": "ER", "SERENE": "ER",
+    "FLY JINNAH": "9P", "JINNAH": "9P",
+
+    # Middle Eastern Carriers
+    "EMIRATES": "EK",
+    "ETIHAD": "EY", "ETIHAD AIRWAYS": "EY",
+    "QATAR": "QR", "QATAR AIRWAYS": "QR",
+    "SAUDIA": "SV", "SAUDI AIR": "SV", "SAUDI ARABIAN AIRLINES": "SV",
+    "GULF AIR": "GF", "GULF": "GF",
+    "KUWAIT AIRWAYS": "KU", "KUWAIT": "KU",
+    "AIR ARABIA": "G9",
+    "FLYNAS": "XY", "FLY NAS": "XY", "NAS AIR": "XY",
+    "SALAM AIR": "OV", "SALAM": "OV",
+    "FLY DUBAI": "FZ", "FLYDUBAI": "FZ",
+    "JAZEERA AIRWAYS": "J9", "JAZEERA": "J9",
+
+    # European & Western
+    "BRITISH AIRWAYS": "BA", "BRITISH": "BA",
+    "TURKISH AIRLINES": "TK", "TURKISH": "TK", "TURKISH AIR": "TK",
+
+    # Asian & Others
+    "THAI AIR": "TG", "THAI AIRWAYS": "TG", "THAI": "TG",
+    "CHINA SOUTHERN": "CZ",
+    "AIR CHINA": "CA",
+    "ARYANA AFGHAN": "FG", "ARYANA": "FG", "AFGHAN AIR": "FG",
+    "KAM AIR": "RQ", "KAM": "RQ",
+    "AZERBAIJAN AIRLINES": "J2", "AZERBAIJAN": "J2", "AZAL": "J2",
+    "IRAQI AIRWAYS": "IA", "IRAQI": "IA",
+    "SOMON AIR": "SZ", "SOMON": "SZ",
+    "UZBEKISTAN AIRWAYS": "HY", "UZBEKISTAN": "HY",
+    "FLYADEAL": "F3", "FLY ADEAL": "F3",
+    
+    # Aviation/Cargo/Private
+    "FLY SKY": "FS", "FLY SKY AVIATION": "FS",
+    
+    # Direct IATA Mappings (Safety catch)
+    "PK": "PK", "PA": "PA", "PF": "PF", "ER": "ER", "9P": "9P",
+    "EK": "EK", "EY": "EY", "QR": "QR", "SV": "SV", "TK": "TK",
+    "BA": "BA", "G9": "G9", "FZ": "FZ", "XY": "XY"
 }
 
 def extract_canonical_flight(query: str):
@@ -51,27 +90,42 @@ def weaviate_search(query, collection):
         )
         coll = client.collections.get(collection)
         
-        # 1. Flight Status ke liye (XML_AGENT)
-        flight_no = extract_canonical_flight(query)
-        if flight_no and collection == "PAA_XML_FLIGHTS":
-            exact = coll.query.fetch_objects(
-                filters=weaviate.classes.query.Filter.by_property("flight_number").equal(flight_no),
-                limit=1
-            )
-            if exact.objects:
+        # --- A. FLIGHT XML AGENT LOGIC ---
+        if collection == "PAA_XML_FLIGHTS":
+            flight_no = extract_canonical_flight(query)
+            # Case 1: Specific Flight Number
+            if flight_no:
+                exact = coll.query.fetch_objects(
+                    filters=weaviate.classes.query.Filter.by_property("flight_number").equal(flight_no),
+                    limit=1
+                )
+                if exact.objects:
+                    client.close()
+                    return [o.properties for o in exact.objects]
+            
+            # Case 2: Airline Filtering (If no flight number, check for Airline Name)
+            q_upper = query.upper()
+            matched_airline = next((name for name in AIRLINE_ALIASES.keys() if name in q_upper), None)
+            if matched_airline:
+                airline_results = coll.query.fetch_objects(
+                    filters=weaviate.classes.query.Filter.by_property("airline_name").like(f"*{matched_airline}*"),
+                    limit=15
+                )
                 client.close()
-                return [o.properties for o in exact.objects]
+                return [o.properties for o in airline_results.objects]
 
-        # 2. Baggage/Policy ke liye (DOC_AGENT)
-        # return_metadata zaroori hai taake pata chale match kitna strong hai
+        # --- B. SEMANTIC SEARCH (DOC_AGENT & WEB_AGENT) ---
+        # Web Agent ke liye hum limit thori barhate hain (more context)
+        limit_val = 5 if collection == "RAG2_Web" else 3
+        
         semantic = coll.query.near_vector(
             near_vector=EMBED.encode(query).tolist(), 
-            limit=3,
+            limit=limit_val,
             return_metadata=weaviate.classes.query.MetadataQuery(distance=True)
         )
         client.close()
 
-        # 0.45 ko 0.55 ya 0.6 kar dein temporary testing ke liye
+        # Distance threshold for accuracy (0.6 is safe for MiniLM)
         results = [o.properties for o in semantic.objects if o.metadata.distance <= 0.6]
         return results
     except Exception as e:
@@ -199,15 +253,16 @@ INTERNAL DATABASE CONTEXT: {internal_results if data_was_found else "NONE"}
 
 STRICT RESPONSE RULES:
 1. SPECIFICITY: 
-   - If user asks about FLIGHT STATUS (XML_AGENT): Provide details in professional bullet points.
-   - If user asks about BAGGAGE/POLICIES (DOC_AGENT): Summarize the rules clearly in bullets.
-   - If a specific detail (like 'gate' or 'liquid limit') is asked, provide ONLY that.
+   - FLIGHT STATUS: Provide details in professional bullet points. If multiple flights are found for an airline, list them as a summary.
+   - BAGGAGE: Summarize the rules clearly. Mention the airline name if specified.
+   - WEB INFO (NOTAMs/Tenders): Provide the information found. 
 
-2. DATA INTEGRITY: Only mention fields that have actual, valid values in the context. 
-3. HIDE EMPTY FIELDS: If a field is missing, null, or says 'Not Specified' in the database, DO NOT mention it.
-4. FALLBACK: If 'INTERNAL DATABASE CONTEXT' is NONE, say: "The specific details were not found in our records. However, based on general knowledge..." and answer in English.
-5. NO DISCLAIMER ON SUCCESS: If data is found from any agent, do NOT say "Internal records not found".
-6. FORMATTING: Use clean bullet points. Strictly no Urdu/Hindi script.
+2. CITATION (CRITICAL): 
+   - If information is from WEB_AGENT, you MUST include the 'source' URL at the end of the response as: "Source: [URL]".
+
+3. DATA INTEGRITY: Only mention fields that have valid values. Hide empty or 'Not Specified' fields.
+4. FALLBACK: If context is NONE, provide a helpful general answer based on common airport knowledge but state it's general info.
+5. FORMATTING: Use clean bullet points. Strictly no Urdu/Hindi script.
 
 User Query: {user_query}
 """
