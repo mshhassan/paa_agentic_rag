@@ -95,6 +95,15 @@ def decompose_query(query, agents):
     return decomposition
 
 # ================= MAIN ENGINE =================
+Bhai, bilkul point ki baat ki hai aapne. Agar gate ka data null ya khali hai, toh uska zikr hi nahi hona chahiye response mein. "Not Specified" ya "N/A" likhne se professional look kharab hota hai.
+
+Maine prompt ko mazeed "Strict" kar diya hai: "If a field is empty or missing in the data, DO NOT mention it at all."
+
+Aap apna run_engine function is final version se replace kar lein:
+
+Python
+
+# ================= FINAL CLEANED MAIN ENGINE =================
 def run_engine(user_query):
     st.session_state.trace.clear()
     st.session_state.agent_status = {k:False for k in st.session_state.agent_status}
@@ -130,25 +139,25 @@ def run_engine(user_query):
         else:
             st.session_state.trace.append(f"⚠️ {agent} returned NOT_FOUND")
 
-    # --- THE FIX: English Only + Bullets for Flight Data ---
+    # --- THE FIX: No 'Not Specified' + English + Bullets ---
     final_prompt = f"""
 You are a professional PAA (Pakistan Airports Authority) Virtual Assistant.
 RESPOND ONLY IN ENGLISH.
 
 INTERNAL DATA FOUND: {internal_results if data_was_found else "NONE"}
 
-RULES:
+STRICT RULES:
 1. IF 'INTERNAL DATA FOUND' is NOT "NONE":
-   - Use this data to provide the flight status.
-   - For flight-related queries, present the information in CLEAR BULLET POINTS.
-   - Do NOT say "internal records not found".
-   - Only include information that is present in the data (e.g., Status, Origin, Destination, Time).
+   - Directly provide the flight status in CLEAR BULLET POINTS.
+   - **CRITICAL**: ONLY include fields that have actual values in the data. 
+   - If a field like 'Gate', 'Estimated Time', or 'Remark' is missing, empty, or 'Not Specified' in the database, DO NOT mention that field at all in your response.
+   - Do NOT say "internal records not found" if you are using this data.
 
 2. IF 'INTERNAL DATA FOUND' is "NONE":
-   - Explicitly state: "The specific flight details were not found in our live database, but according to general flight information..."
+   - State: "The specific details for this query were not found in our live database. However, based on general information..."
    - Then provide details from your own knowledge in English.
 
-3. General: Keep it concise, professional, and strictly in English. No Urdu or Hindi script.
+3. General: No Urdu/Hindi script. Keep it clean and professional.
 
 User Query: {user_query}
 """
@@ -157,6 +166,7 @@ User Query: {user_query}
         messages=[{"role":"system","content":final_prompt}]
     ).choices[0].message.content
     return answer
+    
 # ================= UI =================
 st.title("✈️ PAA Enterprise Intelligence")
 col1,col2 = st.columns([1.2,2])
