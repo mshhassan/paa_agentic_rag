@@ -125,50 +125,42 @@ def weaviate_search(query, collection):
         )
         client.close()
 
-        # Distance threshold for accuracy (0.6 is safe for MiniLM)
-        results = [o.properties for o in semantic.objects if o.metadata.distance <= 0.6]
+        # Web Agent ke liye threshold naram (0.7) rakha hai taake general queries match ho sakein
+        threshold = 0.7 if collection == "RAG2_Web" else 0.6
+        results = [o.properties for o in semantic.objects if o.metadata.distance <= threshold]
         return results
+        
     except Exception as e:
         st.warning(f"Weaviate search failed: {e}")
         return []
 # ================= UPDATED SUPERVISOR (LLM INTEGRATED) =================
 def supervisor_router(query):
     q = query.lower()
-    
-    # Check patterns
     has_flight_no = bool(re.search(r"\b[A-Z]{2}\s?\d{2,4}\b|\b\d{3,4}\b", q, re.I))
     
-    # Keywords
     baggage_keywords = ["baggage", "weight", "luggage", "kg", "policy", "liquid", "items", "allowance", "carry on"]
     status_keywords = ["status", "time", "gate", "schedule", "arrival", "departure", "landed", "where is", "detail"]
-    web_keywords = ["notam", "tender", "official", "website", "complaint", "career"]
+    # Added "paa" and "intro" keywords
+    web_keywords = ["notam", "tender", "official", "website", "complaint", "career", "paa", "about", "introduction", "who is"]
 
     is_baggage = any(word in q for word in baggage_keywords)
     is_status = any(word in q for word in status_keywords)
     is_web = any(word in q for word in web_keywords)
 
     agents = []
-
-    # --- REFINED INTENT LOGIC ---
-    
-    # Case A: If user asks for baggage (with or without flight number)
     if is_baggage:
         agents.append("DOC_AGENT")
-        # Only trigger XML if they specifically ask for "status" or "details" ALONG with baggage
-        if is_status:
-            agents.append("XML_AGENT")
-            
-    # Case B: Pure Flight Status query
+        if is_status: agents.append("XML_AGENT")
     elif has_flight_no or is_status:
         agents.append("XML_AGENT")
 
-    # Case C: Web related
     if is_web:
         agents.append("WEB_AGENT")
 
     if not agents:
         if re.match(r"^(hi|hello|hey|salaam|aoa)\s*$", q): return ["NONE"]
-        return ["XML_AGENT"]
+        # Defaulting to both if unsure, to maximize data retrieval
+        return ["XML_AGENT", "WEB_AGENT"]
 
     return list(set(agents))
 
@@ -244,7 +236,7 @@ def run_engine(user_query):
         else:
             st.session_state.trace.append(f"⚠️ {agent} returned NOT_FOUND")
 
-    # 4. Final Reasoning and Response Construction (UPDATED LOGIC)
+    # 4. Final Reasoning and Response Construction
     final_prompt = f"""
 You are a professional PAA (Pakistan Airports Authority) Virtual Assistant.
 RESPOND ONLY IN ENGLISH.
@@ -252,17 +244,15 @@ RESPOND ONLY IN ENGLISH.
 INTERNAL DATABASE CONTEXT: {internal_results if data_was_found else "NONE"}
 
 STRICT RESPONSE RULES:
-1. SPECIFICITY: 
-   - FLIGHT STATUS: Provide details in professional bullet points. If multiple flights are found for an airline, list them as a summary.
-   - BAGGAGE: Summarize the rules clearly. Mention the airline name if specified.
-   - WEB INFO (NOTAMs/Tenders): Provide the information found. 
-
-2. CITATION (CRITICAL): 
-   - If information is from WEB_AGENT, you MUST include the 'source' URL at the end of the response as: "Source: [URL]".
-
-3. DATA INTEGRITY: Only mention fields that have valid values. Hide empty or 'Not Specified' fields.
-4. FALLBACK: If context is NONE, provide a helpful general answer based on common airport knowledge but state it's general info.
-5. FORMATTING: Use clean bullet points. Strictly no Urdu/Hindi script.
+1. IDENTITY RECOGNITION: 'PAA' and 'Pakistan Airports Authority' are the same entity. Always use context about 'Pakistan Airports Authority' to answer 'PAA' queries.
+2. CITATION (MANDATORY): If information is retrieved from WEB_AGENT context, you MUST include the 'source' URL at the very end of your response as: "Source: [URL]".
+3. SPECIFICITY: 
+   - FLIGHT STATUS: Professional bullet points.
+   - BAGGAGE: Clear summary.
+   - WEB INFO (NOTAMs/Tenders/About PAA): Directly use the text found in WEB_AGENT context.
+4. DATA INTEGRITY: Only mention fields with valid values. 
+5. FALLBACK: If context is NONE, provide a helpful general answer based on common airport knowledge but state it's general info. Never say you don't have info if PAA-related text exists in context.
+6. FORMATTING: Use clean bullet points. Strictly no Urdu/Hindi script.
 
 User Query: {user_query}
 """
