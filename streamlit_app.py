@@ -103,45 +103,54 @@ def run_engine(user_query):
     agents = supervisor_router(user_query)
     st.session_state.trace.append(f"🧠 Supervisor Routing: {agents}")
 
-    if agents==["NONE"]:
+    if agents == ["NONE"]:
         answer = client_openai.chat.completions.create(
             model="gpt-4o", 
-            messages=[{"role":"system","content":"Greet professionally as PAA Assistant in English/Urdu. Avoid Hindi script."},{"role":"user","content":user_query}]
+            messages=[{"role":"system","content":"Greet professionally as PAA Assistant."},{"role":"user","content":user_query}]
         ).choices[0].message.content
         return answer
 
     sub_queries = decompose_query(user_query, agents)
     internal_results = []
-    missing_entities = []
+    
+    # Flags to help LLM understand what happened
+    data_was_found = False
 
     for agent, sub_q in sub_queries.items():
         st.session_state.agent_status[agent] = True
         st.session_state.trace.append(f"➡️ {agent} activated")
+        
         if agent=="XML_AGENT": data = weaviate_search(sub_q, "PAA_XML_FLIGHTS")
         elif agent=="DOC_AGENT": data = weaviate_search(sub_q, "PAAPolicy")
         elif agent=="WEB_AGENT": data = weaviate_search(sub_q, "RAG2_Web")
         else: data = []
 
         if data:
-            internal_results.append({agent: data})
+            # Yahan hum data ko list mein append kar rahe hain
+            internal_results.append({ "source_agent": agent, "content": data })
+            data_was_found = True
             st.session_state.trace.append(f"✅ {agent} found data")
         else:
-            missing_entities.append(agent)
             st.session_state.trace.append(f"⚠️ {agent} returned NOT_FOUND")
 
-    # IMPROVED FINAL PROMPT
+    # --- THE FIX: Updated Prompt Logic ---
     final_prompt = f"""
 You are a professional PAA (Pakistan Airports Authority) Virtual Assistant.
 
-Internal Database Info: {internal_results}
-Agents with NO Record: {missing_entities}
+INTERNAL DATA FOUND: {internal_results if data_was_found else "NONE"}
 
-STRICT RULES:
-1. If Internal Data is available, prioritize it as official record.
-2. If Internal Data is NOT found for a flight (like {user_query}), you MUST say: "Hamare internal records mein iska live status nahi mila, lekin general information ke mutabiq..." 
-3. Provide the flight status/info using your own knowledge ONLY after giving the disclaimer above.
-4. Language: Use a mix of English and Roman Urdu. NEVER use Hindi Devanagari script.
-5. Be professional. Do not mention "Agents" or "Databases" to the user.
+RULES:
+1. IF 'INTERNAL DATA FOUND' is NOT "NONE":
+   - Use THIS data as your primary source. 
+   - Start your response directly with the information (e.g., "Flight SV727 ki maloomat yeh hain...").
+   - Do NOT say "records mein nahi mila".
+   - ONLY mention fields that exist in the data (e.g., if 'gate' is missing, don't mention gates at all).
+
+2. IF 'INTERNAL DATA FOUND' is "NONE":
+   - Say: "Hamare live records mein iska data mojud nahi hai, lekin aam maloomat ke mutabiq..."
+   - Then use your own knowledge to answer.
+
+3. General: Use Roman Urdu/English mix. No Hindi. No mention of 'Agents' or 'Databases'.
 
 User Query: {user_query}
 """
