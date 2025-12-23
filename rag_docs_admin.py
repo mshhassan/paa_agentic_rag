@@ -22,6 +22,7 @@ DOCS_DIR = "rag_docs_data"
 if not os.path.exists(DOCS_DIR):
     os.makedirs(DOCS_DIR)
 
+st.set_page_config(page_title="PAA Document RAG Admin", layout="wide", page_icon="📂")
 st.title("📂 PAA Policy Manager (DOC_AGENT Admin)")
 st.info(f"Upload your PDFs/Docs to `{DOCS_DIR}` to train the Baggage & Policy Agent.")
 
