@@ -6,6 +6,46 @@ from sentence_transformers import SentenceTransformer
 import re
 import json
 
+AIRLINE_ALIASES = {
+    "AIRBLUE": "PA",
+    "AIR BLUE": "PA",
+    "PA": "PA",
+    "PIA": "PK",
+    "PAKISTAN INTERNATIONAL": "PK",
+    "PAKISTAN INTERNATIONAL AIRLINE": "PK",
+    "PK": "PK",
+    "SERENE": "ER",
+    "SERENE AIR": "ER",
+    "AIR SIAL": "PF",
+    "PF": "PF",
+    "TURKISH": "TK",
+    "TURKISH AIRLINES": "TK",
+    "TK": "TK",
+}
+
+def extract_canonical_flight(query: str):
+    q = query.upper().replace("-", " ")
+    q = re.sub(r"\s+", " ", q)
+
+    # PA270 / PK287
+    m = re.search(r"\b([A-Z]{2})\s*(\d{2,4})\b", q)
+    if m:
+        return m.group(1) + m.group(2)
+
+    # 270 PA / 270 AIRBLUE
+    m = re.search(r"\b(\d{2,4})\b", q)
+    if not m:
+        return None
+
+    number = m.group(1)
+
+    for name, iata in AIRLINE_ALIASES.items():
+        if name in q:
+            return iata + number
+
+    return None
+
+
 # ================= CONFIG =================
 st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
 client_openai = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
@@ -33,16 +73,31 @@ def weaviate_search(query, collection):
             cluster_url=st.secrets["WEAVIATE_URL"],
             auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
         )
+
         coll = client.collections.get(collection)
 
-        # Exact match for flight number
-        exact = coll.query.fetch_objects(filters={"path":["flight_number"],"operator":"Equal","valueText":query}, limit=1)
-        if exact.objects:
-            client.close()
-            return [o.properties for o in exact.objects]
+        canonical_flight = extract_canonical_flight(query)
 
-        # Semantic fallback
-        semantic = coll.query.near_vector(near_vector=EMBED.encode(query).tolist(), limit=3)
+        # 1️⃣ Exact flight match
+        if canonical_flight:
+            exact = coll.query.fetch_objects(
+                filters={
+                    "path": ["flight_number"],
+                    "operator": "Equal",
+                    "valueText": canonical_flight
+                },
+                limit=1
+            )
+            if exact.objects:
+                client.close()
+                return [o.properties for o in exact.objects]
+
+        # 2️⃣ Semantic fallback
+        semantic = coll.query.near_vector(
+            near_vector=EMBED.encode(query).tolist(),
+            limit=3
+        )
+
         client.close()
         if semantic.objects:
             return [o.properties for o in semantic.objects]
