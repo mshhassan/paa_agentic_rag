@@ -51,29 +51,51 @@ def weaviate_search(query, collection):
         )
         coll = client.collections.get(collection)
         
-        # 1. Flight Status ke liye (XML_AGENT)
-        flight_no = extract_canonical_flight(query)
-        if flight_no and collection == "PAA_XML_FLIGHTS":
-            exact = coll.query.fetch_objects(
-                filters=weaviate.classes.query.Filter.by_property("flight_number").equal(flight_no),
-                limit=1
-            )
-            if exact.objects:
-                client.close()
-                return [o.properties for o in exact.objects]
+        # 1. Flight Status ke liye (XML_AGENT) logic
+        if collection == "PAA_XML_FLIGHTS":
+            flight_no = extract_canonical_flight(query)
+            
+            # --- AGAR FLIGHT NUMBER HAI ---
+            if flight_no:
+                exact = coll.query.fetch_objects(
+                    filters=weaviate.classes.query.Filter.by_property("flight_number").equal(flight_no),
+                    limit=1
+                )
+                if exact.objects:
+                    client.close()
+                    return [o.properties for o in exact.objects]
+            
+            # --- AGAR SIRF AIRLINE KA NAAM HAI (Sari Flights ke liye) ---
+            # Hum check karte hain ke query mein koi airline ka naam hai ya nahi
+            q_upper = query.upper()
+            matched_airline = None
+            for name in AIRLINE_ALIASES.keys():
+                if name in q_upper:
+                    matched_airline = name
+                    break
+            
+            if matched_airline:
+                # Airline name par filter laga kar flights fetch karein
+                airline_results = coll.query.fetch_objects(
+                    filters=weaviate.classes.query.Filter.by_property("airline_name").like(f"*{matched_airline}*"),
+                    limit=15 # Multiple flights dikhane ke liye limit barha di
+                )
+                if airline_results.objects:
+                    client.close()
+                    return [o.properties for o in airline_results.objects]
 
-        # 2. Baggage/Policy ke liye (DOC_AGENT)
-        # return_metadata zaroori hai taake pata chale match kitna strong hai
+        # 2. Baggage/Policy/Semantic Search (DOC_AGENT / Other Agents)
         semantic = coll.query.near_vector(
             near_vector=EMBED.encode(query).tolist(), 
-            limit=3,
+            limit=5, # Content zyada fetch karne ke liye limit behtar ki
             return_metadata=weaviate.classes.query.MetadataQuery(distance=True)
         )
         client.close()
 
-        # 0.45 ko 0.55 ya 0.6 kar dein temporary testing ke liye
+        # Results filtering based on distance
         results = [o.properties for o in semantic.objects if o.metadata.distance <= 0.6]
         return results
+
     except Exception as e:
         st.warning(f"Weaviate search failed: {e}")
         return []
