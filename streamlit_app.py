@@ -48,6 +48,45 @@ def weaviate_search(query, collection):
     except:
         return []
 
+#====================
+
+def fetch_flight_exact_or_semantic(flight_no):
+    client = weaviate.connect_to_weaviate_cloud(
+        cluster_url=st.secrets["WEAVIATE_URL"],
+        auth_credentials=Auth.api_key(st.secrets["WEAVIATE_API_KEY"])
+    )
+
+    coll = client.collections.get("PAA_XML_FLIGHTS")
+
+    # 1️⃣ EXACT MATCH FIRST
+    exact = coll.query.fetch_objects(
+        filters={
+            "path": ["flight_number"],
+            "operator": "Equal",
+            "valueText": flight_no
+        },
+        limit=1
+    )
+
+    if exact.objects:
+        client.close()
+        return exact.objects[0].properties
+
+    # 2️⃣ SEMANTIC FALLBACK
+    semantic = coll.query.near_vector(
+        near_vector=EMBED.encode(flight_no).tolist(),
+        limit=1
+    )
+
+    client.close()
+    if semantic.objects:
+        return semantic.objects[0].properties
+
+    return None
+
+
+
+
 # ================= SUPERVISOR =================
 def supervisor_router(query):
     routing_prompt = f"""
