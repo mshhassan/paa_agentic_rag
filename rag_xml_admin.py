@@ -25,9 +25,7 @@ def extract_canonical_flight(query: str):
     return None
 
 # --- 2. CONFIG & RESOURCES ---
-
-st.set_page_config(page_title="PAA AODB AFDS Snapshot RAG", layout="wide", page_icon="✈️")
-st.title("✈️ PAA AODB AFDS XML Flight Record RAG")
+st.set_page_config(page_title="PAA Enterprise Intelligence", layout="wide")
 client_openai = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 @st.cache_resource
