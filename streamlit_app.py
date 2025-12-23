@@ -53,13 +53,20 @@ def supervisor_router(query):
     routing_prompt = f"""
 You are an intent and scope analyzer.
 
-Decide which agents are required.
+Decide which agents are required for the user query.
 
 AGENTS:
 - XML_AGENT → flight status, arrival, departure, gate, check-in
 - DOC_AGENT → baggage, hand carry, check-in baggage rules
 - WEB_AGENT → paa.gov.pk notices, tenders, official info
 - NONE → greetings or casual talk
+
+Rules:
+- A query may require more than one agent.
+- Include XML_AGENT if a flight number is mentioned.
+- Include DOC_AGENT if baggage, luggage, hand carry, or check-in baggage is mentioned.
+- Include WEB_AGENT only for website or official notices.
+- Return NONE only if no agent applies.
 
 Return JSON only.
 
@@ -69,9 +76,10 @@ Example:
 Query:
 "{query}"
 """
-    # Regex override for flight numbers
-    if re.search(r"\b[A-Z]{2}\d{2,4}\b", query, re.I):
-        return ["XML_AGENT"]
+
+    # 🔹 Soft signal detection (NOT override)
+    flight_hint = bool(re.search(r"\b[A-Z]{2}\d{2,4}\b", query, re.I))
+    baggage_hint = bool(re.search(r"\bbaggage|luggage|hand\s?carry|check[- ]?in\b", query, re.I))
 
     resp = client_openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -79,7 +87,19 @@ Query:
         messages=[{"role": "system", "content": routing_prompt}]
     )
 
-    return json.loads(resp.choices[0].message.content).get("agents", ["NONE"])
+    agents = json.loads(resp.choices[0].message.content).get("agents", [])
+
+    # 🔹 Safety net (merge hints, don't replace)
+    if flight_hint and "XML_AGENT" not in agents:
+        agents.append("XML_AGENT")
+
+    if baggage_hint and "DOC_AGENT" not in agents:
+        agents.append("DOC_AGENT")
+
+    if not agents:
+        agents = ["NONE"]
+
+    return agents
 
 # ================= QUERY DECOMPOSITION =================
 def decompose_query(query, agents):
